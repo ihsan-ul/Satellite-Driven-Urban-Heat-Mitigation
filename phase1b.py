@@ -104,11 +104,17 @@ lst_downscaled = lst_pred_fine + residual_fine
 lst_downscaled = np.where(finite_lst, lst_downscaled, np.nan)
 
 
-nnew_texture = (np.nan_to_num(lst_downscaled) -
-uniform_filter(np.nan_to_num(lst_downscaled), size=COARSE_FACTOR))
-lst_ds_recoarse = coarsen(np.nan_to_num(lst_downscaled), COARSE_FACTOR)
-rmse = np.sqrt(np.nanmean((lst_ds_recoarse[mask_c.reshape(hc, wc)] -
-lst_c[mask_c.reshape(hc, wc)])**2))
+new_texture = (np.nan_to_num(lst_downscaled) -
+               uniform_filter(np.nan_to_num(lst_downscaled), size=COARSE_FACTOR))
+
+hc2 = H // COARSE_FACTOR; wc2 = W // COARSE_FACTOR
+trim   = lst_downscaled[:hc2*COARSE_FACTOR, :wc2*COARSE_FACTOR]
+blocks = trim.reshape(hc2, COARSE_FACTOR, wc2, COARSE_FACTOR)
+lst_ds_recoarse = np.nanmean(blocks, axis=(1, 3))
+valid_count = np.sum(np.isfinite(blocks), axis=(1, 3))
+full_cells  = valid_count == (COARSE_FACTOR * COARSE_FACTOR)
+compare = full_cells & np.isfinite(lst_c) & np.isfinite(lst_ds_recoarse)
+rmse = np.sqrt(np.nanmean((lst_ds_recoarse[compare] - lst_c[compare])**2))
 
 print("\n================ DOWNSCALING VALIDATION ================")
 print(f"  Local texture std BEFORE : {local_texture[finite_lst].std():.4f} C")
