@@ -41,12 +41,9 @@ S2_SCALE = 10000.0
 
 def mask_landsat_c2(image):
     qa = image.select("QA_PIXEL")
-    dilated = 1 << 1
-    cloud   = 1 << 3
-    shadow  = 1 << 4
-    mask = (qa.bitwiseAnd(dilated).eq(0)
-              .And(qa.bitwiseAnd(cloud).eq(0))
-              .And(qa.bitwiseAnd(shadow).eq(0)))
+    mask = (qa.bitwiseAnd(1 << 1).eq(0)
+              .And(qa.bitwiseAnd(1 << 3).eq(0))
+              .And(qa.bitwiseAnd(1 << 4).eq(0)))
     return image.updateMask(mask)
 
 def add_lst_celsius(image):
@@ -59,17 +56,19 @@ def add_lst_celsius(image):
 l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
 l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
 
-landsat = (l8.merge(l9)
-             .filterBounds(AOI)
-             .filter(ee.Filter.calendarRange(START_YEAR, END_YEAR, "year"))
-             .filter(ee.Filter.calendarRange(SUMMER_START_MONTH,
-                                              SUMMER_END_MONTH, "month"))
-             .map(mask_landsat_c2)
-             .map(add_lst_celsius))
+landsat_coll = (l8.merge(l9)
+                  .filterBounds(AOI)
+                  .filter(ee.Filter.calendarRange(START_YEAR, END_YEAR, "year"))
+                  .filter(ee.Filter.calendarRange(SUMMER_START_MONTH,
+                                                   SUMMER_END_MONTH, "month"))
+                  .map(mask_landsat_c2)
+                  .map(add_lst_celsius))
 
-lst_composite = landsat.select("LST").median().clip(AOI)
-print("Landsat LST composite built.")
+clearest = ee.Image(landsat_coll.sort("CLOUD_COVER").first())
+print("LST scene:", clearest.get("LANDSAT_PRODUCT_ID").getInfo(),
+      "| cloud:", clearest.get("CLOUD_COVER").getInfo(), "%")
 
+lst_composite = clearest.select("LST").clip(AOI)
 
 def mask_s2_clouds(image):
     qa = image.select("QA60")
@@ -122,7 +121,6 @@ print("  LABEL codes -> 0:Other/Bare  1:Vegetation  2:Built-up  3:Water")
 s2_projection = s2_composite.select("B4").projection()
 
 lst_10m = (lst_composite
-           .resample("bilinear")
            .reproject(crs=s2_projection, scale=EXPORT_SCALE)
            .rename("LST"))
 
