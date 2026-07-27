@@ -64,12 +64,13 @@ landsat_coll = (l8.merge(l9)
                   .map(mask_landsat_c2)
                   .map(add_lst_celsius))
 
-clearest = ee.Image(landsat_coll.sort("CLOUD_COVER").first())
-print("LST scene:", clearest.get("LANDSAT_PRODUCT_ID").getInfo(),
-      "| cloud:", clearest.get("CLOUD_COVER").getInfo(), "%")
 
-lst_composite = clearest.select("LST").clip(AOI)
-
+LST_YEAR = 2016
+landsat_season = landsat_coll.filter(
+    ee.Filter.calendarRange(LST_YEAR, LST_YEAR, "year"))
+lst_composite = landsat_season.select("LST").median().clip(AOI)
+print(f"LST: {LST_YEAR} summer median from "
+      f"{landsat_season.size().getInfo()} scenes")
 def mask_s2_clouds(image):
     qa = image.select("QA60")
     cloud_bit  = 1 << 10
