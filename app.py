@@ -1,20 +1,4 @@
-"""
-Dubai Urban Heat Island — Predictive Decision-Support Web App
-=============================================================
-Streamlit + leafmap/folium website. Planners move sliders to run "what-if"
-mitigation scenarios and instantly see the re-simulated cooling map, with
-toggleable layers (pan / zoom / scroll built in).
 
-Streamlit-Cloud-ready version:
-  * Input rasters are pulled from Google Drive at startup (gdown) into /tmp,
-    so nothing large needs to live in the GitHub repo.
-  * Layers are rendered as folium ImageOverlays (matplotlib-colorized PNGs),
-    NOT via leafmap.add_raster(). This avoids localtileserver, which does not
-    work on Streamlit Community Cloud (rasters would otherwise show blank).
-
-Deploy:  push ONLY app.py + requirements.txt to a GitHub repo, then deploy
-         on share.streamlit.io. Set the four Drive file IDs below.
-"""
 import os
 import io
 import base64
@@ -30,21 +14,15 @@ from PIL import Image
 
 st.set_page_config(layout="wide", page_title="Dubai UHI Decision-Support")
 
-# ---------------------------------------------------------------------------
-# DATA HANDLING — download inputs from Google Drive, write outputs to scratch
-# ---------------------------------------------------------------------------
+
 DATA_IN = os.environ.get("UHI_DATA", "/tmp/uhi_data")
 DATA_OUT = os.environ.get("UHI_OUT", "/tmp/uhi_out")
 os.makedirs(DATA_IN, exist_ok=True)
 os.makedirs(DATA_OUT, exist_ok=True)
 
-# >>> EDIT THESE: paste each file's Google Drive ID (from its share link). <<<
-# Share each file as "Anyone with the link". The ID is the long token in:
-#   https://drive.google.com/file/d/<THIS_IS_THE_ID>/view?usp=sharing
 DRIVE_FILE_IDS = {
-    "LST_BASELINE_10M.tif":   "PASTE_DRIVE_ID_1",
-    "LANDCOVER_PRED_10M.tif": "PASTE_DRIVE_ID_2",
-    # Add the other two *_10M.tif inputs if your app needs them.
+    "LST_BASELINE_10M.tif":   "1dvBsiPy9LTbcNXtcb6jOWQcEbRDhQMwH",
+    "LANDCOVER_PRED_10M.tif": "1BhMgtE7KLFHklS2NJn_TvS4zBEJFrY4-",
 }
 
 
@@ -66,7 +44,6 @@ fetch_inputs()
 CLASS_NAMES = ["Vegetation", "Impervious/Built", "Bare/Sand", "Water"]
 CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
 
-# Literature cooling coefficients (deg C local LST reduction) — editable inputs.
 COOL = {
     "green_roof": 1.45,
     "green_roof_hotarid": 1.83,
@@ -115,9 +92,7 @@ def scenario(lst, lc, gr, al):
 scn = scenario(lst, lc, gr, al)
 delta = lst - scn
 
-# ---------------------------------------------------------------------------
-# RENDERING HELPERS — colorize NumPy arrays to PNG overlays (no tile server)
-# ---------------------------------------------------------------------------
+
 def latlon_bounds(profile):
     """Return [[south, west], [north, east]] in EPSG:4326 for folium."""
     w, s, e, n = rasterio.transform.array_bounds(
@@ -175,9 +150,7 @@ def add_overlay(m, rgba, name, show=True):
     ).add_to(m)
 
 
-# ---------------------------------------------------------------------------
-# LAYOUT
-# ---------------------------------------------------------------------------
+
 st.title("AI-Driven Urban Heat Island Mitigation — Dubai")
 c1, c2 = st.columns([3, 1])
 with c2:
