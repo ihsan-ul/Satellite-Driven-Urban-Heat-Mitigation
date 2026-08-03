@@ -1,5 +1,0 @@
-streamlit
-leafmap
-rasterio
-numpy
-gdown
