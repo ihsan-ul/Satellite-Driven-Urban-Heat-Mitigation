@@ -26,6 +26,7 @@ COOL = {
 }
 
 DATA_DIR = "data"
+
 DRIVE_IDS = {
     "LANDCOVER_PRED_10M.tif": "1BhMgtE7KLFHklS2NJn_TvS4zBEJFrY4-",
     "LST_BASELINE_10M.tif":   "1dvBsiPy9LTbcNXtcb6jOWQcEbRDhQMwH",
@@ -33,15 +34,13 @@ DRIVE_IDS = {
     "LST_DELTA_10M.tif":      "1Xv3RvIinFUibHHmf4TiAp2WDwKySzjxI",
 }
 
-LC_FILE  = "LANDCOVER_PRED_10M.tif"
-LST_FILE = "LST_BASELINE_10M.tif"
+LC_FILE   = "LANDCOVER_PRED_10M.tif"
+LST_FILE  = "LST_BASELINE_10M.tif"
 
 MAP_CENTER = [25.10, 55.30]
 MAP_ZOOM   = 10
-DISPLAY_PX = 1100
 
 LC_CMAP = ListedColormap(CLASS_COLORS)
-
 
 
 def ensure_files():
@@ -57,107 +56,72 @@ def ensure_files():
     return DATA_DIR
 
 
-@st.cache_data(show_spinner="Preparing rasters (one-time)…")
-def prepare(lc_path, lst_path, max_px):
-    """Reproject both rasters to a common EPSG:4326 display grid ONCE, and
-    pre-compute the temperature-sorted pixel order for each target class."""
-    def reproject_to_grid(path, nodata, resampling):
-        with rasterio.open(path) as src:
-            dst_crs = "EPSG:4326"
-            transform, w, h = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, *src.bounds)
-            scale = min(1.0, max_px / max(w, h))
-            w, h = max(1, int(w * scale)), max(1, int(h * scale))
-            transform, w, h = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, *src.bounds,
-                dst_width=w, dst_height=h)
-            dst = np.full((h, w), np.nan, "float32")
-            reproject(source=src.read(1), destination=dst,
-                      src_transform=src.transform, src_crs=src.crs,
-                      dst_transform=transform, dst_crs=dst_crs,
-                      src_nodata=nodata, dst_nodata=np.nan,
-                      resampling=resampling)
-            b = transform_bounds(src.crs, dst_crs, *src.bounds)
-        return dst, b
-
-    lc, bounds  = reproject_to_grid(lc_path,  255,     Resampling.nearest)
-    lst, _      = reproject_to_grid(lst_path, -9999.0, Resampling.bilinear)
-
-    lc = np.where(np.isfinite(lc), lc, 255).astype("int16")
+@st.cache_data(show_spinner=False)
+def load_array(path, nodata=None):
+    """Read band 1 as float32; return array, src profile, and lat/lon bounds."""
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype("float32")
+        prof = {"crs": src.crs, "transform": src.transform,
+                "width": src.width, "height": src.height, "bounds": src.bounds}
+        bounds4326 = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+    if nodata is not None:
+        arr = np.where(arr == nodata, np.nan, arr)
+    return arr, prof, bounds4326
 
 
-    orders = {}
-    for cls in (1, 2):
-        flat = np.where((lc == cls) & np.isfinite(lst))[0] if lc.ndim == 1 else \
-               np.where(((lc == cls) & np.isfinite(lst)).ravel())[0]
-        if flat.size:
-            temps = lst.ravel()[flat]
-            orders[cls] = flat[np.argsort(-temps)]
-        else:
-            orders[cls] = np.array([], dtype=np.int64)
-
-    return lc, lst, bounds, orders
-
-
-
-@st.cache_data(show_spinner="Loading full-resolution rasters (one-time)…")
-def prepare_fullres(lc_path, lst_path):
-    """Load both rasters at native 10 m resolution (source CRS) and pre-sort
-    each target class by temperature. Used ONLY for high-accuracy metrics."""
-    with rasterio.open(lc_path) as s:
-        lc = s.read(1).astype("int16")
-    with rasterio.open(lst_path) as s:
-        lst = s.read(1).astype("float32")
-    lst = np.where(lst == -9999.0, np.nan, lst)
-    lc  = np.where(lc == 255, 255, lc).astype("int16")
-
-    orders = {}
-    for cls in (1, 2):
-        flat = np.where(((lc == cls) & np.isfinite(lst)).ravel())[0]
-        if flat.size:
-            orders[cls] = flat[np.argsort(-lst.ravel()[flat])]
-        else:
-            orders[cls] = np.array([], dtype=np.int64)
-    return lc, lst, orders
-
-
-
-def run_scenario_fast(lst, orders, interventions):
-    """Reproduces the thesis 'hottest-fraction of remaining eligible' logic,
-    but using pre-sorted indices so it runs in microseconds."""
-    out    = lst.copy()
-    flat   = out.ravel()
-    offset = {}
+def run_scenario(lst, lc, interventions):
+    """Apply cooling coefficients to the hottest eligible pixels of each target
+    class. A `done` mask ensures no pixel is treated twice."""
+    out  = lst.copy().astype("float32")
+    done = np.zeros_like(lc, bool)
     for iv in interventions:
-        tgt  = iv['target_class']
-        order = orders.get(tgt)
-        if order is None or order.size == 0 or iv['fraction'] <= 0:
+        coef, frac, tgt = COOL[iv['name']], iv['fraction'], iv['target_class']
+        cand = (lc == tgt) & np.isfinite(out) & (~done)
+        idx  = np.where(cand.ravel())[0]
+        if idx.size == 0 or frac <= 0:
             continue
-        off  = offset.get(tgt, 0)
-        rem  = order[off:]
-        n    = int(iv['fraction'] * rem.size)
-        sel  = rem[:n]
-        flat[sel] -= COOL[iv['name']]
-        offset[tgt] = off + n
+        order = idx[np.argsort(-out.ravel()[idx])][:int(frac * idx.size)]
+        rr, cc = np.unravel_index(order, lc.shape)
+        out[rr, cc] -= coef
+        done[rr, cc] = True
     return out
 
 
-def _png_url(rgba):
+@st.cache_data(show_spinner=False)
+def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
+    """_arr in the source CRS; `key` makes the cache unique per logical layer.
+    `max_px` is included in the cache key implicitly (it's an argument), so
+    changing the resolution slider correctly re-renders."""
+    src_crs, src_transform = _prof["crs"], _prof["transform"]
+    src_w, src_h, bounds = _prof["width"], _prof["height"], _prof["bounds"]
+    dst_crs = "EPSG:4326"
+    transform, w, h = calculate_default_transform(
+        src_crs, dst_crs, src_w, src_h, *bounds)
+    scale = min(1.0, max_px / max(w, h))
+    w, h = max(1, int(w * scale)), max(1, int(h * scale))
+    transform, w, h = calculate_default_transform(
+        src_crs, dst_crs, src_w, src_h, *bounds, dst_width=w, dst_height=h)
+
+    data = np.full((h, w), np.nan, "float32")
+    reproject(source=np.ascontiguousarray(_arr), destination=data,
+              src_transform=src_transform, src_crs=src_crs,
+              dst_transform=transform, dst_crs=dst_crs,
+              src_nodata=np.nan, dst_nodata=np.nan,
+              resampling=Resampling.nearest if discrete else Resampling.bilinear)
+    left, bottom, right, top = transform_bounds(src_crs, dst_crs, *bounds)
+
+    alpha = np.isfinite(data)
+    if discrete:
+        idx = np.clip(np.nan_to_num(data, nan=0).astype(int), 0, len(CLASS_COLORS)-1)
+        rgba = (LC_CMAP(idx / max(1, len(CLASS_COLORS)-1)) * 255).astype("uint8")
+    else:
+        norm = np.clip((data - vmin) / (vmax - vmin + 1e-9), 0, 1)
+        rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
+    rgba[..., 3] = np.where(alpha, 255, 0)
+
     buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-def continuous_overlay(arr, cmap, vmin, vmax):
-    norm = np.clip((arr - vmin) / (vmax - vmin + 1e-9), 0, 1)
-    rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
-    rgba[..., 3] = np.where(np.isfinite(arr), 255, 0)
-    return _png_url(rgba)
-
-def discrete_overlay(arr):
-    idx = np.clip(np.nan_to_num(arr, nan=0).astype(int), 0, len(CLASS_COLORS)-1)
-    rgba = (LC_CMAP(idx / max(1, len(CLASS_COLORS)-1)) * 255).astype("uint8")
-    rgba[..., 3] = np.where(arr != 255, 255, 0)
-    return _png_url(rgba)
-
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    return url, [[bottom, left], [top, right]]
 
 
 def colorbar_png(cmap, vmin, vmax, label):
@@ -169,6 +133,7 @@ def colorbar_png(cmap, vmin, vmax, label):
     buf = BytesIO(); fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
+
 
 def land_cover_legend_html():
     rows = "".join(
@@ -183,39 +148,38 @@ def land_cover_legend_html():
 
 st.set_page_config(page_title="Dubai Urban Heat Mitigation", layout="wide")
 st.title("🛰️ Satellite-Driven Urban Heat Mitigation — Dubai")
-st.caption("Interactive what-if planning — sliders update instantly.")
+st.caption("Interactive what-if planning: adjust interventions and watch the cooling respond.")
 
 data_dir = ensure_files()
 lc_path, lst_path = os.path.join(data_dir, LC_FILE), os.path.join(data_dir, LST_FILE)
+
 if not (os.path.exists(lc_path) and os.path.exists(lst_path)):
     st.error(f"Need `{LC_FILE}` and `{LST_FILE}` in `{data_dir}/`. "
              "Add local files or Drive IDs in CONFIG.")
     st.stop()
 
-landcover, lst10, bounds, orders = prepare(lc_path, lst_path, DISPLAY_PX)
-map_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
-
-@st.cache_data(show_spinner=False)
-def base_overlays(_lc, _lst):
-    return discrete_overlay(_lc), continuous_overlay(_lst, "inferno", 30, 58)
-lc_url, base_url = base_overlays(landcover, lst10)
+landcover, lc_prof, bounds = load_array(lc_path, nodata=255)
+landcover = np.nan_to_num(landcover, nan=255).astype("int16")
+lst10, lst_prof, _         = load_array(lst_path, nodata=-9999.0)
 
 
 st.sidebar.header("🎛️ Scenario controls")
 
-st.sidebar.markdown("**Green roofs** (built-up)")
+st.sidebar.markdown("**Green roofs** (on built-up)")
 gr_on   = st.sidebar.checkbox("Enable green roofs", value=True)
 gr_frac = st.sidebar.slider("Green-roof coverage (% of built)", 0, 100, 20, 5) / 100
-gr_coef = st.sidebar.select_slider("Green-roof coefficient (°C)",
-                                   options=[1.0, 1.45, 1.83, 2.0], value=1.83)
+gr_coef = st.sidebar.select_slider(
+    "Green-roof coefficient (°C)",
+    options=[round(v, 2) for v in [1.0, 1.45, 1.83, 2.0]], value=1.83)
 
-st.sidebar.markdown("**High-albedo paving** (built-up)")
+st.sidebar.markdown("**High-albedo paving** (on built-up)")
 al_on   = st.sidebar.checkbox("Enable high-albedo paving", value=True)
 al_frac = st.sidebar.slider("Albedo coverage (% of built)", 0, 100, 30, 5) / 100
-al_coef = st.sidebar.select_slider("Albedo coefficient (°C)",
-                                   options=[1.5, 2.0, 2.5, 3.0], value=2.5)
+al_coef = st.sidebar.select_slider(
+    "Albedo coefficient (°C)",
+    options=[round(v, 2) for v in [1.5, 2.0, 2.5, 3.0]], value=2.5)
 
-st.sidebar.markdown("**Vegetation buffers** (bare soil/sand)")
+st.sidebar.markdown("**Vegetation buffers** (on bare soil/sand)")
 vb_on   = st.sidebar.checkbox("Enable veg buffers", value=False)
 vb_frac = st.sidebar.slider("Veg-buffer coverage (% of bare)", 0, 100, 0, 5) / 100
 
@@ -231,65 +195,49 @@ if vb_on and vb_frac > 0:
     interventions.append({'name': 'veg_buffer',           'fraction': vb_frac, 'target_class': 2})
 
 st.sidebar.divider()
-hi_acc = st.sidebar.checkbox(
-    "🎯 High-accuracy metrics (full 10 m)", value=False,
-    help="Recompute the metric cards at native 10 m resolution — matches your "
-         "thesis numbers exactly. The map stays on the fast display grid.")
+st.sidebar.header("🗺️ Display layers")
+show_lc     = st.sidebar.checkbox("U-Net land cover", value=False)
+show_base   = st.sidebar.checkbox("LST baseline (°C)", value=False)
+show_scn    = st.sidebar.checkbox("LST scenario (°C)", value=False)
+show_delta  = st.sidebar.checkbox("Cooling Δ (°C)", value=True)
+basemap     = st.sidebar.selectbox("Basemap",
+                                   ["Esri.WorldImagery", "OpenStreetMap", "CartoDB positron"])
 
+# --- NEW: appearance controls ---------------------------------------------
 st.sidebar.divider()
-st.sidebar.header("🗺️ Display layer")
-layer = st.sidebar.radio("Show", ["Cooling Δ (°C)", "LST scenario (°C)",
-                                  "LST baseline (°C)", "U-Net land cover"], index=0)
-basemap = st.sidebar.selectbox("Basemap",
-                               ["Esri.WorldImagery", "OpenStreetMap", "CartoDB positron"])
+st.sidebar.header("🎨 Appearance")
+opacity = st.sidebar.slider(
+    "Layer opacity", 0.0, 1.0, 0.85, 0.05,
+    help="Raise toward 1.0 so the basemap stops bleeding through gaps between "
+         "buildings (fixes the washed-out look).")
+res_px = st.sidebar.select_slider(
+    "Display resolution (px)", options=[800, 1100, 1500, 2000, 2500], value=1500,
+    help="Higher = sharper overlays and more solid built-up blocks, but slower "
+         "to render each change.")
 
-lst_scn = run_scenario_fast(lst10, orders, interventions)
+
+lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
+
+
 v       = np.isfinite(delta)
-
-
-def compute_metrics(lc_arr, lst_arr, ord_dict):
-    scn = run_scenario_fast(lst_arr, ord_dict, interventions)
-    d   = lst_arr - scn
-    vv  = np.isfinite(d)
-    bt  = (lc_arr == 1) & vv
-    tr  = bt & (d > 0)
-    return (float(np.nanmean(d[vv]))  if vv.any() else 0.0,
-            float(np.nanmean(d[bt]))  if bt.any() else 0.0,
-            float(np.nanmean(d[tr]))  if tr.any() else 0.0,
-            float(np.nanmax(d[vv]))   if vv.any() else 0.0,
-            100 * tr.sum() / max(1, bt.sum()),
-            float(np.nanmean(lst_arr)), float(np.nanmean(scn)))
-
-if hi_acc:
-    lc_fr, lst_fr, orders_fr = prepare_fullres(lc_path, lst_path)
-    (m_all, m_built, m_treat, max_c, pct_tr,
-     base_mean, scn_mean) = compute_metrics(lc_fr, lst_fr, orders_fr)
-    res_note = "full 10 m resolution"
-else:
-    (m_all, m_built, m_treat, max_c, pct_tr,
-     base_mean, scn_mean) = compute_metrics(landcover, lst10, orders)
-    res_note = f"~{DISPLAY_PX}px display grid (approx.)"
+built   = (landcover == 1) & v
+treated = built & (delta > 0)
+m_all   = float(np.nanmean(delta[v]))          if v.any()       else 0.0
+m_built = float(np.nanmean(delta[built]))       if built.any()   else 0.0
+m_treat = float(np.nanmean(delta[treated]))     if treated.any() else 0.0
+max_c   = float(np.nanmax(delta[v]))            if v.any()       else 0.0
+pct_tr  = 100 * treated.sum() / max(1, built.sum())
 
 st.subheader("📊 Live scenario metrics")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("City-wide mean cooling", f"{m_all:.3f} °C")
 c2.metric("Built-up mean cooling",  f"{m_built:.3f} °C",
-          help="Planner-relevant number (excludes desert dilution).")
+          help="The planner-relevant number (excludes desert dilution).")
 c3.metric("Treated-pixel cooling",  f"{m_treat:.3f} °C")
 c4.metric("Built-up treated",       f"{pct_tr:.1f} %")
-st.caption(f"Baseline city mean: {base_mean:.2f} °C → scenario: {scn_mean:.2f} °C "
-           f"• max local cooling: {max_c:.2f} °C  •  metrics @ {res_note}")
-
-
-if layer == "Cooling Δ (°C)":
-    overlay_url = continuous_overlay(np.where(v & (delta > 0), delta, np.nan), "Blues", 0, 2.5)
-elif layer == "LST scenario (°C)":
-    overlay_url = continuous_overlay(lst_scn, "inferno", 30, 58)
-elif layer == "LST baseline (°C)":
-    overlay_url = base_url
-else:
-    overlay_url = lc_url
+st.caption(f"Baseline city mean: {np.nanmean(lst10):.2f} °C  →  "
+           f"scenario: {np.nanmean(lst_scn):.2f} °C   •   max local cooling: {max_c:.2f} °C")
 
 
 tiles = None if basemap == "Esri.WorldImagery" else basemap
@@ -298,27 +246,58 @@ if basemap == "Esri.WorldImagery":
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="Esri").add_to(fmap)
-folium.raster_layers.ImageOverlay(overlay_url, bounds=map_bounds,
-                                  name=layer, opacity=0.85).add_to(fmap)
-fmap.fit_bounds(map_bounds)
+        attr="Esri", name="Esri.WorldImagery").add_to(fmap)
+
+# cache keys include res_px so changing resolution re-renders correctly
+scn_key = f"{gr_on}{gr_frac}{gr_coef}{al_on}{al_frac}{al_coef}{vb_on}{vb_frac}{res_px}"
+
+if show_lc:
+    url, b = array_to_overlay(landcover.astype("float32"), lc_prof,
+                              None, None, None, True, key=f"lc{res_px}", max_px=res_px)
+    folium.raster_layers.ImageOverlay(url, bounds=b, name="U-Net land cover",
+                                      opacity=opacity).add_to(fmap)
+if show_base:
+    url, b = array_to_overlay(lst10, lst_prof, "inferno", 30, 58, False,
+                              key=f"base{res_px}", max_px=res_px)
+    folium.raster_layers.ImageOverlay(url, bounds=b, name="LST baseline (°C)",
+                                      opacity=opacity).add_to(fmap)
+if show_scn:
+    url, b = array_to_overlay(lst_scn, lst_prof, "inferno", 30, 58, False,
+                              key="scn"+scn_key, max_px=res_px)
+    folium.raster_layers.ImageOverlay(url, bounds=b, name="LST scenario (°C)",
+                                      opacity=opacity).add_to(fmap)
+if show_delta:
+    url, b = array_to_overlay(np.where(v, delta, np.nan), lst_prof, "Blues", 0, 2.5,
+                              False, key="delta"+scn_key, max_px=res_px)
+    folium.raster_layers.ImageOverlay(url, bounds=b, name="Cooling Δ (°C)",
+                                      opacity=opacity).add_to(fmap)
+
+fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+folium.LayerControl(collapsed=False).add_to(fmap)
 
 col_map, col_key = st.columns([4, 1])
 with col_map:
-    st_folium(fmap, width=None, height=600, returned_objects=[],
-              key="uhi_map")
+    st_folium(fmap, width=None, height=600, returned_objects=[])
+
 with col_key:
-    st.markdown("#### Legend")
-    if layer == "U-Net land cover":
+    st.markdown("#### Legends")
+    if show_lc:
         st.markdown(land_cover_legend_html(), unsafe_allow_html=True)
-    elif layer == "Cooling Δ (°C)":
-        b64 = colorbar_png("Blues", 0, 2.5, "Cooling Δ (°C)")
-        st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
-                    unsafe_allow_html=True)
-    else:
+    if show_base or show_scn:
         b64 = colorbar_png("inferno", 30, 58, "LST (°C)")
         st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
                     unsafe_allow_html=True)
+    if show_delta:
+        b64 = colorbar_png("Blues", 0, 2.5, "Cooling Δ (°C)")
+        st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
+                    unsafe_allow_html=True)
 
-st.caption("💡 Tip: keep **Cooling Δ (°C)** selected while dragging sliders — "
-           "it's the layer where changes are most visible.")
+with st.expander("ℹ️ How the scenario works"):
+    st.write(
+        "- Each intervention cools the **hottest** eligible pixels of its target class first.\n"
+        "- A `done` mask prevents any pixel being treated twice, so stacking green roofs + "
+        "albedo on built-up **partitions** the class rather than double-counting.\n"
+        "- Cooling is a first-order **constant subtraction** using empirical coefficients "
+        "(Alaa et al. 2025 and related) — not a physical energy-balance simulation.\n"
+        "- **Built-up mean cooling** is the planner-relevant metric; the city-wide figure is "
+        "diluted by desert and open water.")
