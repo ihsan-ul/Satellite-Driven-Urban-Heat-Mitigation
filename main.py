@@ -1,17 +1,20 @@
-!pip -q install "earthengine-api>=1.4.0" geemap leafmap rasterio rioxarray geopandas localtileserver scikit-learn tensorflow tqdm matplotlib psutil
-import rasterio
-import os, glob, time, warnings, gc
+!pip -q install "earthengine-api>=1.4.0" geemap leafmap rasterio rioxarray \
+     geopandas localtileserver scikit-learn tensorflow tqdm matplotlib psutil
+
+import os, glob, time, warnings, gc, base64
+from io import BytesIO
 import numpy as np
+import rasterio
 import ee, geemap
 warnings.filterwarnings("ignore")
 
 from google.colab import userdata
-
 GEE_PROJECT = userdata.get('GEEID')
 
 USE_DRIVE = True
 DRIVE_DIR = "/content/drive/MyDrive/UHI_Dubai"
 LOCAL_DIR = "/content/UHI_Dubai"
+
 try:
     ee.Initialize(project=GEE_PROJECT)
 except Exception:
@@ -24,11 +27,12 @@ UTM  = "EPSG:32640"
 YEARS = list(range(2016, 2026))
 SUMMER_MONTHS = [6, 7, 8]
 S2_SCALE, LST_SCALE = 10, 30
-NUM_CLASSES = 4
+
+NUM_CLASSES  = 4
 CLASS_NAMES  = ["Vegetation", "Impervious/Built", "Bare soil/Sand", "Water"]
 CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
-os.makedirs(LOCAL_DIR, exist_ok=True)
 
+os.makedirs(LOCAL_DIR, exist_ok=True)
 if USE_DRIVE:
     from google.colab import drive
     drive.mount('/content/drive')
@@ -65,34 +69,28 @@ def build_s2():
           .filter(ee.Filter.calendarRange(YEARS[0], YEARS[-1], 'year'))
           .filter(ee.Filter.calendarRange(SUMMER_MONTHS[0], SUMMER_MONTHS[-1], 'month'))
           .linkCollection(ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED'), ['cs']))
+
     def mask(img):
         img = img.updateMask(img.select('cs').gte(0.6))
-        return (img.select(['B2','B3','B4','B8','B11','B12']).divide(10000)
+        return (img.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']).divide(10000)
                 .copyProperties(img, ['system:time_start']))
+
     comp = s2.map(mask).median().clip(AOI)
-    ndvi = comp.normalizedDifference(['B8','B4']).rename('NDVI')
-    ndbi = comp.normalizedDifference(['B11','B8']).rename('NDBI')
-    ndwi = comp.normalizedDifference(['B3','B8']).rename('NDWI')
+    ndvi = comp.normalizedDifference(['B8', 'B4']).rename('NDVI')
+    ndbi = comp.normalizedDifference(['B11', 'B8']).rename('NDBI')
+    ndwi = comp.normalizedDifference(['B3', 'B8']).rename('NDWI')
     return comp.addBands([ndvi, ndbi, ndwi])
 
 s2_features = build_s2()
 dem = ee.Image('USGS/SRTMGL1_003').select('elevation').clip(AOI).rename('elevation')
-wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map')
-labels = wc.remap([10,20,30,40,50,60,70,80,90,95,100],
-                  [ 0, 0, 0, 0, 1, 2, 2, 3, 0, 0,  0]).rename('class').clip(AOI)
 
-FEAT_BANDS = ['B2','B3','B4','B8','B11','B12','NDVI','NDBI','NDWI','elevation']
+wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map')
+labels = wc.remap([10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100],
+                  [ 0,  0,  0,  0,  1,  2,  2,  3,  0,  0,   0]).rename('class').clip(AOI)
+
+FEAT_BANDS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDBI', 'NDWI', 'elevation']
 feat_stack = s2_features.addBands(dem).select(FEAT_BANDS).toFloat()
 print("Composites built. Feature bands:", feat_stack.bandNames().getInfo())
-
-m = geemap.Map(center=[25.10, 55.30], zoom=10)
-m.addLayer(s2_features, {'bands':['B4','B3','B2'],'min':0,'max':0.3}, 'S2 true colour')
-m.addLayer(lst_baseline, {'min':28,'max':55,'palette':['#2166ac','#67a9cf','#ffffbf','#fdae61','#d73027']}, 'LST (°C)')
-m.addLayer(labels, {'min':0,'max':3,'palette':CLASS_COLORS}, 'Reference land cover')
-m
-
-import rasterio
-from rasterio.merge import merge as rio_merge
 
 def export_drive(image, name, scale):
     task = ee.batch.Export.image.toDrive(
@@ -100,9 +98,9 @@ def export_drive(image, name, scale):
         fileNamePrefix=name, region=AOI, scale=scale, crs=UTM,
         maxPixels=int(1e13), fileFormat='GeoTIFF')
     task.start()
-    print(f"[{name}] batch export started (scale {scale} m)…", end="", flush=True)
+    print(f"[{name}] batch export started (scale {scale} m)…", end='', flush=True)
     while task.active():
-        time.sleep(20); print(".", end="", flush=True)
+        time.sleep(20); print(".", end='', flush=True)
     print(" ->", task.status().get('state'))
 
 def load_raster(name, retries=24, delay=5):
@@ -138,27 +136,6 @@ _ = get_layer(lst_baseline, 'LST_30M',         LST_SCALE)
 del _; gc.collect()
 print("Exports finished.")
 
-import rasterio
-
-def load_raster(name, retries=24, delay=5):
-    pattern = os.path.join(OUT, name + '*.tif')
-    files = sorted(glob.glob(pattern))
-    for _ in range(retries):
-        if files:
-            break
-        time.sleep(delay)
-        try:
-            from google.colab import drive
-            drive.flush_and_unmount()
-            drive.mount('/content/drive')
-        except Exception:
-            pass
-        files = sorted(glob.glob(pattern))
-    assert files, (f"No file found for {name} in {OUT} after {retries*delay}s. "
-                   f"Check the export finished AND that OUT points to the mounted folder.")
-    with rasterio.open(files[0]) as s:
-        return s.read(), s.profile
-
 feat_arr,  feat_prof  = load_raster('S2_FEATURES_10M')
 label_arr, label_prof = load_raster('LABELS_10M')
 lst30_arr, lst30_prof = load_raster('LST_30M')
@@ -168,17 +145,11 @@ H, W  = feat_arr.shape[1], feat_arr.shape[2]
 
 X = np.moveaxis(feat_arr, 0, -1).astype('float32')
 del feat_arr; gc.collect()
-
 Y = label_arr[0].astype('int32')
 del label_arr; gc.collect()
 
 valid = np.isfinite(X).all(-1) & np.isin(Y, np.arange(NUM_CLASSES))
 np.nan_to_num(X, copy=False)
-
-
-def _bi(n): return FEAT_BANDS.index(n)
-P10_raw = np.stack([X[..., _bi('NDVI')], X[..., _bi('NDBI')],
-                    X[..., _bi('NDWI')], X[..., _bi('elevation')]], -1).astype('float32')
 
 mean = X[valid].mean(0); std = X[valid].std(0) + 1e-6
 X -= mean; X /= std
@@ -197,12 +168,12 @@ def make_patches(img, msk, lab):
     xs, ys, ws = [], [], []
     for r in starts(img.shape[0], PATCH, STRIDE):
         for c in starts(img.shape[1], PATCH, STRIDE):
-            m = msk[r:r+PATCH, c:c+PATCH]
-            if m.shape != (PATCH, PATCH) or m.mean() < 0.25:
+            mm = msk[r:r+PATCH, c:c+PATCH]
+            if mm.shape != (PATCH, PATCH) or mm.mean() < 0.25:
                 continue
             xs.append(img[r:r+PATCH, c:c+PATCH, :])
             ys.append(lab[r:r+PATCH, c:c+PATCH])
-            ws.append(m)
+            ws.append(mm)
     return (np.asarray(xs, 'float16'),
             np.asarray(ys, 'uint8'),
             np.asarray(ws, 'float16'))
@@ -210,11 +181,11 @@ def make_patches(img, msk, lab):
 split = int(W * 0.75)
 Xtr, Ytr, Wtr = make_patches(Xn[:, :split], valid[:, :split], Y[:, :split])
 Xva, Yva, Wva = make_patches(Xn[:, split:], valid[:, split:], Y[:, split:])
-print("Train patches:", Xtr.shape, "| Val patches:", Xva.shape)
+print("Train patches:", Xtr.shape, " Val patches:", Xva.shape)
 
 uniq, cnt = np.unique(Y[valid], return_counts=True)
 print("Class balance:", {CLASS_NAMES[u]: int(c) for u, c in zip(uniq, cnt)})
-del Y, uniq, cnt; gc.collect()
+del uniq, cnt; gc.collect()
 
 import tensorflow as tf
 from tensorflow.keras import layers, Model
@@ -224,7 +195,7 @@ for g in tf.config.list_physical_devices('GPU'):
         tf.config.experimental.set_memory_growth(g, True)
     except Exception:
         pass
-print("GPU:", tf.config.list_physical_devices('GPU') or "none (Runtime→Change runtime type→GPU)")
+print("GPU:", tf.config.list_physical_devices('GPU'))
 
 USE_MIXED_PRECISION = bool(tf.config.list_physical_devices('GPU'))
 if USE_MIXED_PRECISION:
@@ -269,7 +240,6 @@ hist = model.fit(Xtr, Ytr, sample_weight=Wtr,
                  epochs=60, batch_size=4, callbacks=cbs, verbose=1)
 model.save(os.path.join(OUT, 'unet_dubai.keras'))
 print("Model saved to", os.path.join(OUT, 'unet_dubai.keras'))
-
 del Xtr, Ytr, Wtr; gc.collect()
 
 from sklearn.metrics import f1_score, jaccard_score, confusion_matrix
@@ -284,18 +254,19 @@ f1  = f1_score(yt, yp, average=None, labels=range(NUM_CLASSES))
 print(f"{'Class':18s}{'IoU':>8s}{'F1':>8s}")
 for i, n in enumerate(CLASS_NAMES):
     print(f"{n:18s}{iou[i]:8.3f}{f1[i]:8.3f}")
-print("-"*34)
-print(f"mean IoU = {iou.mean():.3f}   macro-F1 = {f1_score(yt,yp,average='macro'):.3f}   OA = {(yt==yp).mean():.3f}")
+print("-" * 34)
+print(f"mean IoU = {iou.mean():.3f}   macro-F1 = {f1_score(yt,yp,average='macro'):.3f}   "
+      f"OA = {(yt==yp).mean():.3f}")
 
 cm = confusion_matrix(yt, yp, labels=range(NUM_CLASSES), normalize='true')
-plt.figure(figsize=(5,4)); plt.imshow(cm, cmap='Blues', vmin=0, vmax=1)
-plt.xticks(range(NUM_CLASSES), CLASS_NAMES, rotation=45, ha='right'); plt.yticks(range(NUM_CLASSES), CLASS_NAMES)
+plt.figure(figsize=(5, 4)); plt.imshow(cm, cmap='Blues', vmin=0, vmax=1)
+plt.xticks(range(NUM_CLASSES), CLASS_NAMES, rotation=45, ha='right')
+plt.yticks(range(NUM_CLASSES), CLASS_NAMES)
 for i in range(NUM_CLASSES):
     for j in range(NUM_CLASSES):
         plt.text(j, i, f"{cm[i,j]:.2f}", ha='center', va='center')
 plt.title('Normalised confusion matrix'); plt.colorbar(); plt.tight_layout()
 plt.savefig(os.path.join(OUT, 'confusion_matrix.png'), dpi=120); plt.show()
-
 del pv, mask, yt, yp, Xva, Yva, Wva; gc.collect()
 
 prob = np.zeros((H, W, NUM_CLASSES), 'float32'); cnt = np.zeros((H, W), 'float32')
@@ -303,7 +274,7 @@ for r in starts(H, PATCH, STRIDE):
     for c in starts(W, PATCH, STRIDE):
         p = model.predict(Xn[r:r+PATCH, c:c+PATCH, :][None], verbose=0)[0]
         prob[r:r+PATCH, c:c+PATCH] += p
-        cnt[r:r+PATCH, c:c+PATCH]  += 1
+        cnt[r:r+PATCH,  c:c+PATCH] += 1
 prob /= np.maximum(cnt[..., None], 1)
 landcover = prob.argmax(-1).astype('uint8'); landcover[~valid] = 255
 
@@ -311,30 +282,26 @@ prof_lc = feat_prof.copy(); prof_lc.update(count=1, dtype='uint8', nodata=255)
 with rasterio.open(os.path.join(OUT, 'LANDCOVER_PRED_10M.tif'), 'w', **prof_lc) as d:
     d.write(landcover, 1)
 
-frac = {CLASS_NAMES[i]: float((landcover==i).sum())/valid.sum() for i in range(NUM_CLASSES)}
+frac = {CLASS_NAMES[i]: float((landcover == i).sum()) / valid.sum() for i in range(NUM_CLASSES)}
 print("Saved LANDCOVER_PRED_10M.tif  | class fractions:",
-      {k: round(v,3) for k,v in frac.items()})
-
-del prob, cnt, Xn; gc.collect()
+      {k: round(v, 3) for k, v in frac.items()})
+del prob, cnt; gc.collect()
 
 from rasterio.warp import reproject, Resampling
 from sklearn.ensemble import RandomForestRegressor
-import numpy as np, os, gc, time
 
 def bidx(name): return FEAT_BANDS.index(name)
-
-print("H,W =", H, W, "| total 10 m px =", f"{H*W:,}", "| NUM_CLASSES =", NUM_CLASSES)
+print("H,W =", H, W, " total 10 m px =", f"{H*W:,}", " NUM_CLASSES =", NUM_CLASSES)
 
 P10 = np.stack([X[..., bidx('NDVI')], X[..., bidx('NDBI')],
                 X[..., bidx('NDWI')], X[..., bidx('elevation')]], -1).astype('float32')
-
 onehot = np.eye(NUM_CLASSES, dtype='float32')[np.clip(landcover, 0, NUM_CLASSES-1)]
 onehot[landcover == 255] = 0
 P10 = np.concatenate([P10, onehot], -1).astype('float32')
 del onehot; gc.collect()
 del X
 N_FEAT = P10.shape[-1]
-print("Predictor stack:", P10.shape, "| features =", N_FEAT)
+print("Predictor stack:", P10.shape, " features =", N_FEAT)
 
 lst30 = lst30_arr[0].astype('float32')
 agg_pred = np.zeros((N_FEAT, lst30.shape[0], lst30.shape[1]), 'float32')
@@ -347,31 +314,18 @@ Ptr = np.moveaxis(agg_pred, 0, -1).reshape(-1, N_FEAT)
 ytr = lst30.reshape(-1)
 ok  = np.isfinite(ytr) & np.isfinite(Ptr).all(-1) & (ytr > 0)
 del agg_pred; gc.collect()
-print("30 m train grid =", lst30.shape, "| valid train rows =", f"{int(ok.sum()):,}")
+print("30 m train grid =", lst30.shape, " valid train rows =", f"{int(ok.sum()):,}")
 
 Xok, yok = Ptr[ok], ytr[ok]
-print(f"Training on ALL {Xok.shape,} valid 30 m rows")
+print(f"Training on ALL {Xok.shape} valid 30 m rows")
 
 rf = RandomForestRegressor(
-    n_estimators     = 200,
-    max_depth        = 20,
-    max_samples      = 0.3,
-    max_features     = 0.5,
-    min_samples_leaf = 5,
-    n_jobs           = -1,
-    random_state     = 0,
-    verbose          = 1,
-)
+    n_estimators=200, max_depth=20, max_samples=0.3, max_features=0.5,
+    min_samples_leaf=5, n_jobs=-1, random_state=0, verbose=1)
 t = time.time()
 rf.fit(Xok, yok)
-print(f"fit done in {time.time()-t:.1f}s | R^2 (30 m fit): {rf.score(Xok, yok):.3f}")
-
-
-del Ptr, ytr, Xok, yok
-try: del X
-except NameError: pass
-gc.collect()
-
+print(f"fit done in {time.time()-t:.1f}s  R^2 (30 m fit): {rf.score(Xok, yok):.3f}")
+del Ptr, ytr, Xok, yok; gc.collect()
 
 rf.set_params(n_jobs=-1)
 flat = P10.reshape(-1, N_FEAT)
@@ -390,7 +344,6 @@ lst10 = lst10.reshape(H, W)
 lst10[~valid] = np.nan
 del flat, idx; gc.collect()
 
-
 back = np.zeros_like(lst30)
 reproject(lst10, back, src_transform=feat_prof['transform'], src_crs=feat_prof['crs'],
           dst_transform=lst30_prof['transform'], dst_crs=lst30_prof['crs'],
@@ -399,16 +352,14 @@ mm = np.isfinite(back) & np.isfinite(lst30) & (lst30 > 0)
 rmse = float(np.sqrt(np.mean((back[mm] - lst30[mm])**2)))
 mae  = float(np.mean(np.abs(back[mm] - lst30[mm])))
 bias = float(np.mean(back[mm] - lst30[mm]))
-print(f"\nRMSE vs 30 m baseline = {rmse:.2f} °C  (target ≤ 2.7 °C)  "
-      f"| MAE = {mae:.2f} °C | bias = {bias:+.2f} °C")
-
+print(f"\nRMSE vs 30 m baseline = {rmse:.2f} °C  (target <= 2.7 °C)   "
+      f"MAE = {mae:.2f} °C  bias = {bias:+.2f} °C")
 
 prof1 = feat_prof.copy(); prof1.update(count=1, dtype='float32', nodata=float('nan'))
 with rasterio.open(os.path.join(OUT, 'LST_BASELINE_10M.tif'), 'w', **prof1) as d:
     d.write(lst10, 1)
 print("Saved LST_BASELINE_10M.tif")
-
-del back, lst30, mm; gc.collect()
+del back, mm; gc.collect()
 
 COOL = {
     'green_roof':           1.45,
@@ -419,7 +370,6 @@ COOL = {
 }
 
 def run_scenario(lst, lc, interventions):
-
     out  = lst.copy().astype('float32')
     done = np.zeros_like(lc, bool)
     for iv in interventions:
@@ -444,26 +394,37 @@ delta   = lst10 - lst_scn
 
 with rasterio.open(os.path.join(OUT, 'LST_SCENARIO_10M.tif'), 'w', **prof1) as d:
     d.write(lst_scn, 1)
-with rasterio.open(os.path.join(OUT, 'LST_DELTA_10M.tif'),    'w', **prof1) as d:
+with rasterio.open(os.path.join(OUT, 'LST_DELTA_10M.tif'), 'w', **prof1) as d:
     d.write(np.nan_to_num(delta), 1)
 
-v = np.isfinite(delta)
-print(f"City mean LST baseline : {np.nanmean(lst10):.2f} °C")
-print(f"City mean LST scenario : {np.nanmean(lst_scn):.2f} °C")
-print(f"Mean city-wide cooling : {np.nanmean(delta[v]):.3f} °C")
-print(f"Max local cooling      : {np.nanmax(delta[v]):.2f} °C")
+v       = np.isfinite(delta)
+built   = (landcover == 1) & v
+treated = built & (delta > 0)
+print(f"City mean LST baseline      : {np.nanmean(lst10):.2f} °C")
+print(f"City mean LST scenario      : {np.nanmean(lst_scn):.2f} °C")
+print(f"Mean cooling (whole AOI)    : {np.nanmean(delta[v]):.3f} °C")
+print(f"Mean cooling (built-up)     : {np.nanmean(delta[built]):.3f} °C")
+print(f"Mean cooling (treated only) : {np.nanmean(delta[treated]):.3f} °C")
+print(f"Built-up pixels treated     : {treated.sum():,} / {built.sum():,} "
+      f"({100*treated.sum()/max(1,built.sum()):.1f}%)")
+print(f"Max local cooling           : {np.nanmax(delta[v]):.2f} °C")
 print("Saved LST_SCENARIO_10M.tif and LST_DELTA_10M.tif")
-del lst_scn, delta, v; gc.collect()
+del lst_scn; gc.collect()
 
 fr = np.linspace(0, 1, 11)
-g = [np.nanmean(lst10 - run_scenario(lst10, landcover, [{'name':'green_roof_hotarid','fraction':f,'target_class':1}])) for f in fr]
-a = [np.nanmean(lst10 - run_scenario(lst10, landcover, [{'name':'high_albedo_pavement','fraction':f,'target_class':2}])) for f in fr]
-plt.figure(figsize=(7,4))
-plt.plot(fr*100, g, 'o-', label='Green roofs (built-up)')
-plt.plot(fr*100, a, 's-', label='High-albedo (bare/paved)')
-plt.xlabel('% of target surface treated'); plt.ylabel('City-wide mean cooling (°C)')
-plt.title('Sensitivity of city cooling to intervention intensity'); plt.legend(); plt.grid(True)
-plt.tight_layout(); plt.savefig(os.path.join(OUT,'sensitivity.png'), dpi=120); plt.show()
+plt.figure(figsize=(7, 4))
+for iv in interventions:
+    curve = [np.nanmean(lst10 - run_scenario(
+                lst10, landcover,
+                [{'name': iv['name'], 'fraction': f, 'target_class': iv['target_class']}]))
+             for f in fr]
+    plt.plot(fr * 100, curve, 'o-',
+             label=f"{iv['name']} → class {iv['target_class']}")
+plt.xlabel('% of target surface treated')
+plt.ylabel('City-wide mean cooling (°C)')
+plt.title('Sensitivity of city cooling to intervention intensity')
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig(os.path.join(OUT, 'sensitivity.png'), dpi=120); plt.show()
 
 def fix_nan_nodata(path, nodata=-9999.0):
     with rasterio.open(path) as src:
@@ -474,7 +435,7 @@ def fix_nan_nodata(path, nodata=-9999.0):
     with rasterio.open(path, 'w', **profile) as dst:
         dst.write(data, 1)
     with rasterio.open(path) as chk:
-        print(f"{os.path.basename(path):26s} nodata={chk.nodata}  hasNaN={np.isnan(chk.read(1)).any()}")
+        print(f"{os.path.basename(path):26s} nodata={nodata} hasNaN={np.isnan(chk.read(1)).any()}")
 
 for f in ['LST_BASELINE_10M.tif', 'LST_SCENARIO_10M.tif', 'LST_DELTA_10M.tif']:
     fix_nan_nodata(os.path.join(OUT, f))
@@ -486,68 +447,55 @@ for f in os.listdir(OUT):
         shutil.copy(os.path.join(OUT, f), os.path.join(LOCAL, f))
 print("copied to", LOCAL)
 
-
-import os, numpy as np, matplotlib.pyplot as plt
-import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from rasterio.enums import Resampling as RS
 import leafmap
 from ipyleaflet import ImageOverlay
-import base64
-from io import BytesIO
 from PIL import Image
+from matplotlib.colors import ListedColormap
+from rasterio.warp import transform_bounds, calculate_default_transform
 
 SRC = LOCAL
+LC_CMAP = ListedColormap(CLASS_COLORS)
 
 def raster_to_overlay(path, cmap, vmin=None, vmax=None, nodata=None,
                       discrete=False, max_px=2000):
-
     with rasterio.open(path) as src:
+        dst_crs = "EPSG:4326"
+        transform, w, h = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds)
+        scale = min(1.0, max_px / max(w, h))
+        w, h = max(1, int(w * scale)), max(1, int(h * scale))
+        transform, w, h = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds,
+            dst_width=w, dst_height=h)
+        data = np.full((h, w), np.nan, "float32")
+        reproject(
+            source=src.read(1), destination=data,
+            src_transform=src.transform, src_crs=src.crs,
+            dst_transform=transform, dst_crs=dst_crs,
+            src_nodata=nodata, dst_nodata=np.nan,
+            resampling=Resampling.nearest if discrete else Resampling.bilinear)
+        left, bottom, right, top = transform_bounds(src.crs, dst_crs, *src.bounds)
 
-        scale = min(1.0, max_px / max(src.width, src.height))
-        out_w, out_h = int(src.width * scale), int(src.height * scale)
-        data = src.read(1, out_shape=(out_h, out_w),
-                        resampling=Resampling.nearest).astype("float32")
-        t = src.transform * src.transform.scale(src.width / out_w,
-                                                src.height / out_h)
-        src_crs, src_nodata = src.crs, src.nodata
-
-    dst_crs = "EPSG:4326"
-    dt, dw, dh = calculate_default_transform(
-        src_crs, dst_crs, out_w, out_h,
-        *rasterio.transform.array_bounds(out_h, out_w, t))
-    dst = np.full((dh, dw), np.nan, "float32")
-    reproject(data, dst, src_transform=t, src_crs=src_crs,
-              dst_transform=dt, dst_crs=dst_crs, resampling=Resampling.nearest)
-
-    nd = nodata if nodata is not None else src_nodata
-    mask = np.isnan(dst)
-    if nd is not None:
-        mask |= (dst == nd)
-    if nd == 255 or discrete:
-        mask |= (dst >= 254)
+    alpha = np.isfinite(data)
+    if nodata is not None:
+        alpha &= (data != nodata)
 
     if discrete:
-        rgba = plt.get_cmap(cmap)(np.clip(dst, 0, 9).astype(int) / 9.0)
+        idx = np.clip(np.nan_to_num(data, nan=0).astype(int), 0, len(CLASS_COLORS) - 1)
+        rgba = (LC_CMAP(idx / max(1, len(CLASS_COLORS) - 1)) * 255).astype("uint8")
     else:
-        lo = vmin if vmin is not None else np.nanpercentile(dst, 2)
-        hi = vmax if vmax is not None else np.nanpercentile(dst, 98)
-        norm = np.clip((dst - lo) / (hi - lo + 1e-9), 0, 1)
-        rgba = plt.get_cmap(cmap)(norm)
-    rgba[..., 3] = np.where(mask, 0, 0.9)
+        norm = np.clip((data - vmin) / (vmax - vmin + 1e-9), 0, 1)
+        rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
 
-    img = Image.fromarray((rgba * 255).astype("uint8"), "RGBA")
-    buf = BytesIO(); img.save(buf, "PNG")
+    rgba[..., 3] = np.where(alpha, 255, 0)
+    buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
     url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-    south, north = dt.f + dt.e * dh, dt.f
-    west,  east  = dt.c, dt.c + dt.a * dw
-    return url, [[min(south, north), min(west, east)],
-                 [max(south, north), max(west, east)]]
+    bounds = [[bottom, left], [top, right]]
+    return url, bounds
 
 specs = [
     dict(f="LANDCOVER_PRED_10M.tif", name="U-Net land cover",
-         cmap="tab10", discrete=True, nodata=255),
+         cmap=None, discrete=True, nodata=255),
     dict(f="LST_BASELINE_10M.tif",   name="LST baseline (°C)",
          cmap="inferno", vmin=30, vmax=58, nodata=-9999.0),
     dict(f="LST_SCENARIO_10M.tif",   name="LST scenario (°C)",
@@ -570,8 +518,7 @@ for s in specs:
     ov = ImageOverlay(url=url, bounds=bounds, name=s["name"])
     m.add_layer(ov)
     if first:
-        m.fit_bounds(bounds)
-        first = False
+        m.fit_bounds(bounds); first = False
     print(f"added {s['name']}  bounds={bounds}")
 
 legend = {n: c for n, c in zip(CLASS_NAMES, CLASS_COLORS)}
@@ -581,6 +528,5 @@ try:
 except TypeError:
     cols = [plt.get_cmap("inferno")(i/9) for i in range(10)]
     m.add_colorbar(colors=cols, vmin=30, vmax=58, label="LST (°C)")
-
 m.add_layer_control()
 m
