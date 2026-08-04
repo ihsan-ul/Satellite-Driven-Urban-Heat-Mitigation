@@ -1,178 +1,194 @@
-
 import os
-import io
 import base64
+from io import BytesIO
+
 import numpy as np
-import rasterio
-from rasterio.warp import transform_bounds
-import matplotlib
 import streamlit as st
-import folium
-import leafmap.foliumap as leafmap
-import gdown
+import rasterio
+from rasterio.warp import (reproject, Resampling, transform_bounds,
+                           calculate_default_transform)
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from PIL import Image
-
-st.set_page_config(layout="wide", page_title="Dubai UHI Decision-Support")
-
-
-DATA_IN = os.environ.get("UHI_DATA", "/tmp/uhi_data")
-DATA_OUT = os.environ.get("UHI_OUT", "/tmp/uhi_out")
-os.makedirs(DATA_IN, exist_ok=True)
-os.makedirs(DATA_OUT, exist_ok=True)
-
-DRIVE_FILE_IDS = {
-    "LST_BASELINE_10M.tif":   "1dvBsiPy9LTbcNXtcb6jOWQcEbRDhQMwH",
-    "LANDCOVER_PRED_10M.tif": "1BhMgtE7KLFHklS2NJn_TvS4zBEJFrY4-",
-}
+import folium
+from streamlit_folium import st_folium
 
 
-@st.cache_data(show_spinner="Downloading rasters from Google Drive…")
-def fetch_inputs():
-    for name, fid in DRIVE_FILE_IDS.items():
-        dst = os.path.join(DATA_IN, name)
-        if not os.path.exists(dst) or os.path.getsize(dst) == 0:
-            if not fid or fid.startswith("PASTE_"):
-                st.error(f"Missing Google Drive ID for {name}. "
-                         f"Edit DRIVE_FILE_IDS in app.py.")
-                st.stop()
-            gdown.download(id=fid, output=dst, quiet=True)
-    return True
-
-
-fetch_inputs()
-
-CLASS_NAMES = ["Vegetation", "Impervious/Built", "Bare/Sand", "Water"]
+CLASS_NAMES  = ["Vegetation", "Impervious/Built", "Bare soil/Sand", "Water"]
 CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
 
-COOL = {
-    "green_roof": 1.45,
-    "green_roof_hotarid": 1.83,
-    "cool_roof_albedo": 2.0,
-    "high_albedo_pavement": 2.5,
-    "veg_buffer": 1.0,
+DATA_DIR = "data"
+
+
+DRIVE_IDS = {
+    "LANDCOVER_PRED_10M.tif": "1BhMgtE7KLFHklS2NJn_TvS4zBEJFrY4-",
+    "LST_BASELINE_10M.tif":   "1dvBsiPy9LTbcNXtcb6jOWQcEbRDhQMwH",
+    "LST_SCENARIO_10M.tif":   "1D3ougnYocq_2zV1ueiuvUum3AzJVtxsR",
+    "LST_DELTA_10M.tif":      "1Xv3RvIinFUibHHmf4TiAp2WDwKySzjxI",
 }
 
+SPECS = [
+    dict(f="LANDCOVER_PRED_10M.tif", name="U-Net land cover",
+         cmap=None,      vmin=None, vmax=None, nodata=255,     discrete=True,  show=True),
+    dict(f="LST_BASELINE_10M.tif",   name="LST baseline (°C)",
+         cmap="inferno", vmin=30,   vmax=58,   nodata=-9999.0, discrete=False, show=False),
+    dict(f="LST_SCENARIO_10M.tif",   name="LST scenario (°C)",
+         cmap="inferno", vmin=30,   vmax=58,   nodata=-9999.0, discrete=False, show=False),
+    dict(f="LST_DELTA_10M.tif",      name="Cooling Δ (°C)",
+         cmap="Blues",   vmin=0,    vmax=2.5,  nodata=-9999.0, discrete=False, show=False),
+]
 
-@st.cache_data
-def load(name):
-    with rasterio.open(os.path.join(DATA_IN, name)) as s:
-        return s.read(1), s.profile
-
-
-lst, prof = load("LST_BASELINE_10M.tif")
-lc, _ = load("LANDCOVER_PRED_10M.tif")
-
-st.sidebar.title("Dubai UHI Mitigation Simulator")
-gr = st.sidebar.slider("Green roofs on built-up (%)", 0, 100, 20)
-al = st.sidebar.slider("High-albedo on bare/paved (%)", 0, 100, 30)
-st.sidebar.markdown("---")
-show_lc = st.sidebar.checkbox("Land cover", True)
-show_base = st.sidebar.checkbox("LST baseline", True)
-show_scn = st.sidebar.checkbox("LST scenario", True)
-show_delta = st.sidebar.checkbox("Cooling delta", True)
+MAP_CENTER = [25.10, 55.30]
+MAP_ZOOM   = 10
+MAX_PX     = 2000
 
 
-def scenario(lst, lc, gr, al):
-    out = lst.copy().astype("float32")
-    done = np.zeros_like(lc, bool)
-    for frac, coef, tgt in [
-        (gr / 100, COOL["green_roof_hotarid"], 1),
-        (al / 100, COOL["high_albedo_pavement"], 2),
-    ]:
-        cand = (lc == tgt) & np.isfinite(out) & (~done)
-        idx = np.where(cand.ravel())[0]
-        if idx.size and frac > 0:
-            order = idx[np.argsort(-out.ravel()[idx])][: int(frac * idx.size)]
-            r, c = np.unravel_index(order, lc.shape)
-            out[r, c] -= coef
-            done[r, c] = True
-    return out
+LC_CMAP = ListedColormap(CLASS_COLORS)
 
 
-scn = scenario(lst, lc, gr, al)
-delta = lst - scn
+def ensure_files():
+    """Download from Drive if IDs provided, else expect local DATA_DIR files."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    for fname, fid in DRIVE_IDS.items():
+        dest = os.path.join(DATA_DIR, fname)
+        if fid and not os.path.exists(dest):
+            try:
+                import gdown
+                gdown.download(id=fid, output=dest, quiet=False)
+            except Exception as e:
+                st.warning(f"Could not download {fname}: {e}")
+    return DATA_DIR
 
 
-def latlon_bounds(profile):
-    """Return [[south, west], [north, east]] in EPSG:4326 for folium."""
-    w, s, e, n = rasterio.transform.array_bounds(
-        profile["height"], profile["width"], profile["transform"]
-    )
-    src_crs = profile.get("crs")
-    if src_crs and src_crs.to_epsg() != 4326:
-        w, s, e, n = transform_bounds(src_crs, "EPSG:4326", w, s, e, n)
-    return [[s, w], [n, e]]
 
+@st.cache_data(show_spinner=False)
+def raster_to_overlay(path, cmap, vmin, vmax, nodata, discrete, max_px=MAX_PX):
+    with rasterio.open(path) as src:
+        dst_crs = "EPSG:4326"
+        transform, w, h = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds)
+        scale = min(1.0, max_px / max(w, h))
+        w, h = max(1, int(w * scale)), max(1, int(h * scale))
+        transform, w, h = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds,
+            dst_width=w, dst_height=h)
+        data = np.full((h, w), np.nan, "float32")
+        reproject(
+            source=src.read(1), destination=data,
+            src_transform=src.transform, src_crs=src.crs,
+            dst_transform=transform, dst_crs=dst_crs,
+            src_nodata=nodata, dst_nodata=np.nan,
+            resampling=Resampling.nearest if discrete else Resampling.bilinear)
+        left, bottom, right, top = transform_bounds(src.crs, dst_crs, *src.bounds)
 
-BOUNDS = latlon_bounds(prof)
+    alpha = np.isfinite(data)
+    if nodata is not None:
+        alpha &= (data != nodata)
 
-
-def _to_png_url(rgba):
-    img = Image.fromarray(rgba, "RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-
-def colorize_continuous(arr, cmap_name, alpha=200):
-    a = arr.astype("float32")
-    finite = np.isfinite(a)
-    if finite.any():
-        vmin = np.nanpercentile(a[finite], 2)
-        vmax = np.nanpercentile(a[finite], 98)
+    if discrete:
+        idx = np.clip(np.nan_to_num(data, nan=0).astype(int), 0, len(CLASS_COLORS) - 1)
+        rgba = (LC_CMAP(idx / max(1, len(CLASS_COLORS) - 1)) * 255).astype("uint8")
     else:
-        vmin, vmax = 0.0, 1.0
-    norm = np.clip((a - vmin) / (vmax - vmin + 1e-9), 0, 1)
-    cmap = matplotlib.colormaps.get_cmap(cmap_name)
-    rgba = (cmap(np.nan_to_num(norm)) * 255).astype("uint8")
-    rgba[..., 3] = np.where(finite, alpha, 0).astype("uint8")
-    return rgba
+        norm = np.clip((data - vmin) / (vmax - vmin + 1e-9), 0, 1)
+        rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
+
+    rgba[..., 3] = np.where(alpha, 255, 0)
+    buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    bounds = [[bottom, left], [top, right]]
+    return url, bounds
 
 
-def colorize_categorical(arr, colors, alpha=200):
-    a = arr.astype("int")
-    rgba = np.zeros((*a.shape, 4), dtype="uint8")
-    for i, hexc in enumerate(colors):
-        h = hexc.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        m = a == i
-        rgba[m] = [r, g, b, alpha]
-    return rgba
+
+def colorbar_png(cmap, vmin, vmax, label):
+    """Return a base64 PNG of a horizontal colorbar."""
+    fig, ax = plt.subplots(figsize=(3.2, 0.4))
+    grad = np.linspace(0, 1, 256).reshape(1, -1)
+    ax.imshow(grad, aspect="auto", cmap=cmap, extent=[vmin, vmax, 0, 1])
+    ax.set_yticks([]); ax.set_xlabel(label, fontsize=8)
+    ax.tick_params(labelsize=7)
+    plt.tight_layout(pad=0.2)
+    buf = BytesIO(); fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
-def add_overlay(m, rgba, name, show=True):
+def land_cover_legend_html():
+    rows = "".join(
+        f'<div style="display:flex;align-items:center;margin:2px 0;">'
+        f'<span style="width:14px;height:14px;background:{c};display:inline-block;'
+        f'margin-right:6px;border:1px solid #333;"></span>'
+        f'<span style="font-size:12px;">{n}</span></div>'
+        for n, c in zip(CLASS_NAMES, CLASS_COLORS))
+    return (f'<div style="background:white;padding:8px;border:1px solid #999;'
+            f'border-radius:4px;"><b style="font-size:12px;">Land cover</b>{rows}</div>')
+
+
+
+st.set_page_config(page_title="Dubai Urban Heat Mitigation", layout="wide")
+st.title("🛰️ Satellite-Driven Urban Heat Mitigation — Dubai")
+st.caption("U-Net land cover • LST baseline • What-if scenario • Cooling Δ")
+
+data_dir = ensure_files()
+
+st.sidebar.header("Layers")
+active = {}
+for s in SPECS:
+    active[s["name"]] = st.sidebar.checkbox(s["name"], value=s["show"])
+
+basemap = st.sidebar.selectbox("Basemap",
+                               ["Esri.WorldImagery", "OpenStreetMap", "CartoDB positron"])
+
+tiles = None if basemap == "Esri.WorldImagery" else basemap
+fmap = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM,
+                  tiles=tiles, control_scale=True)
+if basemap == "Esri.WorldImagery":
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+              "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri", name="Esri.WorldImagery").add_to(fmap)
+
+missing, first_bounds = [], None
+for s in SPECS:
+    if not active[s["name"]]:
+        continue
+    path = os.path.join(data_dir, s["f"])
+    if not os.path.exists(path):
+        missing.append(s["f"]); continue
+    url, bounds = raster_to_overlay(
+        path, s["cmap"], s["vmin"], s["vmax"], s["nodata"], s["discrete"])
     folium.raster_layers.ImageOverlay(
-        image=_to_png_url(rgba),
-        bounds=BOUNDS,
-        name=name,
-        opacity=1.0,
-        show=show,
-    ).add_to(m)
+        image=url, bounds=bounds, name=s["name"], opacity=0.85).add_to(fmap)
+    first_bounds = first_bounds or bounds
 
+if first_bounds:
+    fmap.fit_bounds(first_bounds)
+folium.LayerControl(collapsed=False).add_to(fmap)
 
+col_map, col_key = st.columns([4, 1])
+with col_map:
+    st_folium(fmap, width=None, height=620, returned_objects=[])
 
-st.title("AI-Driven Urban Heat Island Mitigation — Dubai")
-c1, c2 = st.columns([3, 1])
-with c2:
-    st.metric("Mean city cooling (C)", f"{np.nanmean(delta):.3f}")
-    st.metric("Max local cooling (C)", f"{np.nanmax(delta):.2f}")
-    st.metric("Baseline mean LST (C)", f"{np.nanmean(lst):.2f}")
-    st.metric("Scenario mean LST (C)", f"{np.nanmean(scn):.2f}")
-with c1:
-    m = leafmap.Map(center=[25.10, 55.30], zoom=10)
-    m.add_basemap("HYBRID")
-    if show_lc:
-        add_overlay(m, colorize_categorical(lc, CLASS_COLORS),
-                    "Land cover", show=True)
-    if show_base:
-        add_overlay(m, colorize_continuous(lst, "inferno"),
-                    "LST baseline", show=True)
-    if show_scn:
-        add_overlay(m, colorize_continuous(scn, "inferno"),
-                    "LST scenario", show=True)
-    if show_delta:
-        add_overlay(m, colorize_continuous(delta, "Blues"),
-                    "Cooling delta", show=True)
-    m.add_legend(title="Land cover", labels=CLASS_NAMES, colors=CLASS_COLORS)
-    folium.LayerControl(collapsed=False).add_to(m)
-    m.to_streamlit(height=720)
+with col_key:
+    st.markdown("#### Legends")
+    if active["U-Net land cover"]:
+        st.markdown(land_cover_legend_html(), unsafe_allow_html=True)
+    if active["LST baseline (°C)"] or active["LST scenario (°C)"]:
+        b64 = colorbar_png("inferno", 30, 58, "LST (°C)")
+        st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
+                    unsafe_allow_html=True)
+    if active["Cooling Δ (°C)"]:
+        b64 = colorbar_png("Blues", 0, 2.5, "Cooling Δ (°C)")
+        st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
+                    unsafe_allow_html=True)
+
+if missing:
+    st.error("Missing file(s): " + ", ".join(missing) +
+             f"\n\nExpected in `{data_dir}/`. Add local files or Drive IDs in CONFIG.")
+
+with st.expander("ℹ️ About this map"):
+    st.write(
+        "- **U-Net land cover** — semantic segmentation (4 classes).\n"
+        "- **LST baseline** — 10 m downscaled summer Land Surface Temperature.\n"
+        "- **LST scenario** — baseline after applying green-roof + high-albedo interventions.\n"
+        "- **Cooling Δ** — baseline − scenario (°C); only treated built-up pixels change.")
