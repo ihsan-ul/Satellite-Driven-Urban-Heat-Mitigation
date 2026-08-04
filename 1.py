@@ -1,23 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Streamlit app — Satellite-Driven Urban Heat Mitigation (Dubai)
-FAST interactive planning tool.
-
-Speed strategy
---------------
-The two costly steps are done ONCE and cached, so moving a slider is instant:
-  1) Reproject land cover + baseline LST to the EPSG:4326 *display grid* once.
-  2) Pre-sort each target class's pixels by temperature once.
-Then each slider change is just: slice the pre-sorted indices, subtract a
-coefficient, and recolour — pure NumPy on the small display array (no argsort,
-no reprojection).
-
-USAGE
------
-    pip install streamlit streamlit-folium folium rasterio numpy matplotlib pillow gdown
-    streamlit run streamlit_app.py
-"""
-
 import os
 import base64
 from io import BytesIO
@@ -33,12 +13,9 @@ from PIL import Image
 import folium
 from streamlit_folium import st_folium
 
-# ============================================================================
-# CONFIG  — EDIT THIS SECTION
-# ============================================================================
+
 CLASS_NAMES  = ["Vegetation", "Impervious/Built", "Bare soil/Sand", "Water"]
-CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]   # 0,1,2,3
-# indices: 0=Vegetation 1=Impervious/Built 2=Bare soil/Sand 3=Water
+CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
 
 COOL = {
     'green_roof':           1.45,
@@ -50,8 +27,10 @@ COOL = {
 
 DATA_DIR = "data"
 DRIVE_IDS = {
-    "LANDCOVER_PRED_10M.tif": "",   # <-- REQUIRED  Drive ID
-    "LST_BASELINE_10M.tif":   "",   # <-- REQUIRED  Drive ID
+    "LANDCOVER_PRED_10M.tif": "1BhMgtE7KLFHklS2NJn_TvS4zBEJFrY4-",
+    "LST_BASELINE_10M.tif":   "1dvBsiPy9LTbcNXtcb6jOWQcEbRDhQMwH",
+    "LST_SCENARIO_10M.tif":   "1D3ougnYocq_2zV1ueiuvUum3AzJVtxsR",
+    "LST_DELTA_10M.tif":      "1Xv3RvIinFUibHHmf4TiAp2WDwKySzjxI",
 }
 
 LC_FILE  = "LANDCOVER_PRED_10M.tif"
@@ -59,15 +38,12 @@ LST_FILE = "LST_BASELINE_10M.tif"
 
 MAP_CENTER = [25.10, 55.30]
 MAP_ZOOM   = 10
-DISPLAY_PX = 1100          # display-grid resolution (lower = faster)
-# ============================================================================
+DISPLAY_PX = 1100
 
 LC_CMAP = ListedColormap(CLASS_COLORS)
 
 
-# ---------------------------------------------------------------------------
-# Data acquisition
-# ---------------------------------------------------------------------------
+
 def ensure_files():
     os.makedirs(DATA_DIR, exist_ok=True)
     for fname, fid in DRIVE_IDS.items():
@@ -81,9 +57,6 @@ def ensure_files():
     return DATA_DIR
 
 
-# ---------------------------------------------------------------------------
-# ONE-TIME heavy prep (cached): reproject to display grid + pre-sort classes
-# ---------------------------------------------------------------------------
 @st.cache_data(show_spinner="Preparing rasters (one-time)…")
 def prepare(lc_path, lst_path, max_px):
     """Reproject both rasters to a common EPSG:4326 display grid ONCE, and
@@ -112,24 +85,21 @@ def prepare(lc_path, lst_path, max_px):
 
     lc = np.where(np.isfinite(lc), lc, 255).astype("int16")
 
-    # Pre-sort pixels of each target class by baseline temperature (descending).
-    # Applying an intervention later is then just an index-slice — no argsort.
+
     orders = {}
-    for cls in (1, 2):                      # 1=built, 2=bare (veg buffers)
+    for cls in (1, 2):
         flat = np.where((lc == cls) & np.isfinite(lst))[0] if lc.ndim == 1 else \
                np.where(((lc == cls) & np.isfinite(lst)).ravel())[0]
         if flat.size:
             temps = lst.ravel()[flat]
-            orders[cls] = flat[np.argsort(-temps)]   # hottest first
+            orders[cls] = flat[np.argsort(-temps)]
         else:
             orders[cls] = np.array([], dtype=np.int64)
 
     return lc, lst, bounds, orders
 
 
-# ---------------------------------------------------------------------------
-# FULL-RESOLUTION prep (cached separately, only built when high-accuracy is on)
-# ---------------------------------------------------------------------------
+
 @st.cache_data(show_spinner="Loading full-resolution rasters (one-time)…")
 def prepare_fullres(lc_path, lst_path):
     """Load both rasters at native 10 m resolution (source CRS) and pre-sort
@@ -151,22 +121,20 @@ def prepare_fullres(lc_path, lst_path):
     return lc, lst, orders
 
 
-# ---------------------------------------------------------------------------
-# FAST scenario (no argsort — just slices the pre-sorted order)
-# ---------------------------------------------------------------------------
+
 def run_scenario_fast(lst, orders, interventions):
     """Reproduces the thesis 'hottest-fraction of remaining eligible' logic,
     but using pre-sorted indices so it runs in microseconds."""
     out    = lst.copy()
     flat   = out.ravel()
-    offset = {}                              # pixels already consumed per class
+    offset = {}
     for iv in interventions:
         tgt  = iv['target_class']
         order = orders.get(tgt)
         if order is None or order.size == 0 or iv['fraction'] <= 0:
             continue
         off  = offset.get(tgt, 0)
-        rem  = order[off:]                   # still-eligible, hottest first
+        rem  = order[off:]
         n    = int(iv['fraction'] * rem.size)
         sel  = rem[:n]
         flat[sel] -= COOL[iv['name']]
@@ -174,9 +142,6 @@ def run_scenario_fast(lst, orders, interventions):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Fast colourisers (operate on the display grid — no reprojection)
-# ---------------------------------------------------------------------------
 def _png_url(rgba):
     buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
@@ -194,9 +159,7 @@ def discrete_overlay(arr):
     return _png_url(rgba)
 
 
-# ---------------------------------------------------------------------------
-# Legend / colorbar helpers
-# ---------------------------------------------------------------------------
+
 def colorbar_png(cmap, vmin, vmax, label):
     fig, ax = plt.subplots(figsize=(3.2, 0.4))
     grad = np.linspace(0, 1, 256).reshape(1, -1)
@@ -218,9 +181,6 @@ def land_cover_legend_html():
             f'border-radius:4px;"><b style="font-size:12px;">Land cover</b>{rows}</div>')
 
 
-# ===========================================================================
-# UI
-# ===========================================================================
 st.set_page_config(page_title="Dubai Urban Heat Mitigation", layout="wide")
 st.title("🛰️ Satellite-Driven Urban Heat Mitigation — Dubai")
 st.caption("Interactive what-if planning — sliders update instantly.")
@@ -232,19 +192,15 @@ if not (os.path.exists(lc_path) and os.path.exists(lst_path)):
              "Add local files or Drive IDs in CONFIG.")
     st.stop()
 
-# --- heavy prep runs ONCE (cached) -----------------------------------------
 landcover, lst10, bounds, orders = prepare(lc_path, lst_path, DISPLAY_PX)
 map_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
 
-# --- baseline land-cover / LST overlays computed ONCE (cached) -------------
 @st.cache_data(show_spinner=False)
 def base_overlays(_lc, _lst):
     return discrete_overlay(_lc), continuous_overlay(_lst, "inferno", 30, 58)
 lc_url, base_url = base_overlays(landcover, lst10)
 
-# ---------------------------------------------------------------------------
-# Sidebar — scenario controls
-# ---------------------------------------------------------------------------
+
 st.sidebar.header("🎛️ Scenario controls")
 
 st.sidebar.markdown("**Green roofs** (built-up)")
@@ -287,12 +243,9 @@ layer = st.sidebar.radio("Show", ["Cooling Δ (°C)", "LST scenario (°C)",
 basemap = st.sidebar.selectbox("Basemap",
                                ["Esri.WorldImagery", "OpenStreetMap", "CartoDB positron"])
 
-# ---------------------------------------------------------------------------
-# FAST live computation for the MAP (microseconds, on the display grid)
-# ---------------------------------------------------------------------------
 lst_scn = run_scenario_fast(lst10, orders, interventions)
 delta   = lst10 - lst_scn
-v       = np.isfinite(delta)   # used by the map overlay below
+v       = np.isfinite(delta)
 
 
 def compute_metrics(lc_arr, lst_arr, ord_dict):
@@ -328,9 +281,7 @@ c4.metric("Built-up treated",       f"{pct_tr:.1f} %")
 st.caption(f"Baseline city mean: {base_mean:.2f} °C → scenario: {scn_mean:.2f} °C "
            f"• max local cooling: {max_c:.2f} °C  •  metrics @ {res_note}")
 
-# ---------------------------------------------------------------------------
-# Pick the overlay for the chosen layer (only the dynamic ones recompute)
-# ---------------------------------------------------------------------------
+
 if layer == "Cooling Δ (°C)":
     overlay_url = continuous_overlay(np.where(v & (delta > 0), delta, np.nan), "Blues", 0, 2.5)
 elif layer == "LST scenario (°C)":
@@ -340,9 +291,7 @@ elif layer == "LST baseline (°C)":
 else:
     overlay_url = lc_url
 
-# ---------------------------------------------------------------------------
-# Map (single overlay -> lighter + faster than stacking 4)
-# ---------------------------------------------------------------------------
+
 tiles = None if basemap == "Esri.WorldImagery" else basemap
 fmap = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles=tiles, control_scale=True)
 if basemap == "Esri.WorldImagery":
@@ -357,7 +306,7 @@ fmap.fit_bounds(map_bounds)
 col_map, col_key = st.columns([4, 1])
 with col_map:
     st_folium(fmap, width=None, height=600, returned_objects=[],
-              key="uhi_map")            # stable key => no full component remount
+              key="uhi_map")
 with col_key:
     st.markdown("#### Legend")
     if layer == "U-Net land cover":
