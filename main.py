@@ -1,5 +1,5 @@
-
 !pip -q install "earthengine-api>=1.4.0" geemap leafmap rasterio rioxarray geopandas localtileserver scikit-learn tensorflow tqdm matplotlib psutil
+import rasterio
 import os, glob, time, warnings, gc
 import numpy as np
 import ee, geemap
@@ -138,6 +138,27 @@ _ = get_layer(lst_baseline, 'LST_30M',         LST_SCALE)
 del _; gc.collect()
 print("Exports finished.")
 
+import rasterio
+
+def load_raster(name, retries=24, delay=5):
+    pattern = os.path.join(OUT, name + '*.tif')
+    files = sorted(glob.glob(pattern))
+    for _ in range(retries):
+        if files:
+            break
+        time.sleep(delay)
+        try:
+            from google.colab import drive
+            drive.flush_and_unmount()
+            drive.mount('/content/drive')
+        except Exception:
+            pass
+        files = sorted(glob.glob(pattern))
+    assert files, (f"No file found for {name} in {OUT} after {retries*delay}s. "
+                   f"Check the export finished AND that OUT points to the mounted folder.")
+    with rasterio.open(files[0]) as s:
+        return s.read(), s.profile
+
 feat_arr,  feat_prof  = load_raster('S2_FEATURES_10M')
 label_arr, label_prof = load_raster('LABELS_10M')
 lst30_arr, lst30_prof = load_raster('LST_30M')
@@ -145,7 +166,7 @@ lst30_arr, lst30_prof = load_raster('LST_30M')
 BANDS = feat_arr.shape[0]
 H, W  = feat_arr.shape[1], feat_arr.shape[2]
 
-X = np.moveaxis(feat_arr, 0, -1).astype('float32')     
+X = np.moveaxis(feat_arr, 0, -1).astype('float32')
 del feat_arr; gc.collect()
 
 Y = label_arr[0].astype('int32')
@@ -277,7 +298,6 @@ plt.savefig(os.path.join(OUT, 'confusion_matrix.png'), dpi=120); plt.show()
 
 del pv, mask, yt, yp, Xva, Yva, Wva; gc.collect()
 
-
 prob = np.zeros((H, W, NUM_CLASSES), 'float32'); cnt = np.zeros((H, W), 'float32')
 for r in starts(H, PATCH, STRIDE):
     for c in starts(W, PATCH, STRIDE):
@@ -391,14 +411,15 @@ print("Saved LST_BASELINE_10M.tif")
 del back, lst30, mm; gc.collect()
 
 COOL = {
-    'green_roof':          1.45,
-    'green_roof_hotarid':  1.83,
-    'cool_roof_albedo':    2.00,
-    'high_albedo_pavement':2.50,
-    'veg_buffer':          1.00,
+    'green_roof':           1.45,
+    'green_roof_hotarid':   1.83,
+    'cool_roof_albedo':     2.00,
+    'high_albedo_pavement': 2.50,
+    'veg_buffer':           1.00,
 }
 
 def run_scenario(lst, lc, interventions):
+
     out  = lst.copy().astype('float32')
     done = np.zeros_like(lc, bool)
     for iv in interventions:
@@ -409,18 +430,22 @@ def run_scenario(lst, lc, interventions):
             continue
         order = idx[np.argsort(-out.ravel()[idx])][:int(frac * idx.size)]
         rr, cc = np.unravel_index(order, lc.shape)
-        out[rr, cc] -= coef; done[rr, cc] = True
+        out[rr, cc] -= coef
+        done[rr, cc] = True
     return out
 
 interventions = [
-    {'name':'green_roof_hotarid',  'fraction':0.20, 'target_class':1},
-    {'name':'high_albedo_pavement','fraction':0.30, 'target_class':2},
+    {'name': 'green_roof_hotarid',   'fraction': 0.20, 'target_class': 1},
+    {'name': 'high_albedo_pavement', 'fraction': 0.30, 'target_class': 1},
 ]
+
 lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
 
-with rasterio.open(os.path.join(OUT,'LST_SCENARIO_10M.tif'),'w',**prof1) as d: d.write(lst_scn, 1)
-with rasterio.open(os.path.join(OUT,'LST_DELTA_10M.tif'),   'w',**prof1) as d: d.write(np.nan_to_num(delta), 1)
+with rasterio.open(os.path.join(OUT, 'LST_SCENARIO_10M.tif'), 'w', **prof1) as d:
+    d.write(lst_scn, 1)
+with rasterio.open(os.path.join(OUT, 'LST_DELTA_10M.tif'),    'w', **prof1) as d:
+    d.write(np.nan_to_num(delta), 1)
 
 v = np.isfinite(delta)
 print(f"City mean LST baseline : {np.nanmean(lst10):.2f} °C")
