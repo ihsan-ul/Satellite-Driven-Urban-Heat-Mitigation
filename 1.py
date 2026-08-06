@@ -1,7 +1,6 @@
 import os
 import base64
 from io import BytesIO
-
 import numpy as np
 import streamlit as st
 import rasterio
@@ -13,9 +12,10 @@ from PIL import Image
 import folium
 from streamlit_folium import st_folium
 
-
-CLASS_NAMES  = ["Vegetation", "Impervious/Built", "Bare soil/Sand", "Water"]
-CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
+# ---- 5-CLASS SCHEME (Building/Roof and Road/Pavement now separate) --------
+CLASS_NAMES  = ["Vegetation", "Building/Roof", "Road/Pavement",
+                "Bare soil/Sand", "Water"]
+CLASS_COLORS = ["#1a9850", "#d73027", "#4d4d4d", "#fee08b", "#4575b4"]
 CLASS_INDEX  = {n: i for i, n in enumerate(CLASS_NAMES)}
 
 COOL = {
@@ -28,11 +28,12 @@ COOL = {
 
 DATA_DIR = "data"
 
+# NOTE: after re-exporting the 5-class rasters, replace these with the NEW IDs.
 DRIVE_IDS = {
-    "LANDCOVER_PRED_10M.tif": "1mMTNbQAD9eKKKqwtibf-VA5uiiZBznvV",
-    "LST_BASELINE_10M.tif":   "1teySbI4X0UcjVs-oL07cnfInywGnG1mY",
-    "LST_SCENARIO_10M.tif":   "1ODuEu7UjTdUFiQiiVyHfEIm33u10pAhZ",
-    "LST_DELTA_10M.tif":      "1--mYkjmkw1fvgK9UkK9RWgDfDLvzw85I",
+    "LANDCOVER_PRED_10M.tif": "1L9fEQwyLzQ8w83JGlMgLZSZcRa2no7N0",
+    "LST_BASELINE_10M.tif":   "1Wwk10b0ZH-QpvEGnC8Hmfb4iPwScXeK5",
+    "LST_SCENARIO_10M.tif":   "1TUiVdzFPSyI235ZJx3iR-4qzx6F0bHdE",
+    "LST_DELTA_10M.tif":      "1p9zeRWTlIdFGELMZZIOoKI7JW8za5WNj",
 }
 
 LC_FILE   = "LANDCOVER_PRED_10M.tif"
@@ -170,11 +171,10 @@ def land_cover_legend_html():
 
 st.set_page_config(page_title="Dubai Urban Heat Mitigation", layout="wide")
 st.title("🛰️ Satellite-Driven Urban Heat Mitigation — Dubai")
-st.caption("Interactive what-if planning: choose surfaces, strategy, and intensity.")
+st.caption("Green roofs → rooftops • High-albedo paving → roads. Choose surfaces, strategy, and intensity.")
 
 data_dir = ensure_files()
 lc_path, lst_path = os.path.join(data_dir, LC_FILE), os.path.join(data_dir, LST_FILE)
-
 if not (os.path.exists(lc_path) and os.path.exists(lst_path)):
     st.error(f"Need `{LC_FILE}` and `{LST_FILE}` in `{data_dir}/`. "
              "Add local files or Drive IDs in CONFIG.")
@@ -184,22 +184,19 @@ landcover, lc_prof, bounds = load_array(lc_path, nodata=255)
 landcover = np.nan_to_num(landcover, nan=255).astype("int16")
 lst10, lst_prof, _         = load_array(lst_path, nodata=-9999.0)
 
-
 st.sidebar.header("🎛️ Scenario controls")
-
 strat_label = st.sidebar.selectbox(
     "Selection strategy", list(STRATEGIES.keys()), index=0,
     help="How pixels are chosen WITHIN a target class. 'Hottest first' targets "
          "the worst hotspots; 'Area-based' spreads treatment fairly across the "
          "whole class so newer/cooler buildings also get treated.")
 strategy = STRATEGIES[strat_label]
-
 st.sidebar.divider()
 
 st.sidebar.markdown("**Green roofs**")
 gr_on   = st.sidebar.checkbox("Enable green roofs", value=True)
 gr_tgt  = st.sidebar.selectbox("Green-roof target surface", CLASS_NAMES,
-                               index=1, key="gr_tgt")
+                               index=CLASS_INDEX["Building/Roof"], key="gr_tgt")
 gr_frac = st.sidebar.slider("Green-roof coverage (%)", 0, 100, 20, 5) / 100
 gr_coef = st.sidebar.select_slider("Green-roof coefficient (°C)",
                                    options=[1.0, 1.45, 1.83, 2.0], value=1.83)
@@ -207,7 +204,7 @@ gr_coef = st.sidebar.select_slider("Green-roof coefficient (°C)",
 st.sidebar.markdown("**High-albedo paving**")
 al_on   = st.sidebar.checkbox("Enable high-albedo paving", value=True)
 al_tgt  = st.sidebar.selectbox("Albedo target surface", CLASS_NAMES,
-                               index=1, key="al_tgt")
+                               index=CLASS_INDEX["Road/Pavement"], key="al_tgt")
 al_frac = st.sidebar.slider("Albedo coverage (%)", 0, 100, 30, 5) / 100
 al_coef = st.sidebar.select_slider("Albedo coefficient (°C)",
                                    options=[1.5, 2.0, 2.5, 3.0], value=2.5)
@@ -215,7 +212,7 @@ al_coef = st.sidebar.select_slider("Albedo coefficient (°C)",
 st.sidebar.markdown("**Vegetation buffers**")
 vb_on   = st.sidebar.checkbox("Enable veg buffers", value=False)
 vb_tgt  = st.sidebar.selectbox("Veg-buffer target surface", CLASS_NAMES,
-                               index=2, key="vb_tgt")
+                               index=CLASS_INDEX["Bare soil/Sand"], key="vb_tgt")
 vb_frac = st.sidebar.slider("Veg-buffer coverage (%)", 0, 100, 0, 5) / 100
 
 COOL['green_roof_hotarid']   = gr_coef
@@ -249,10 +246,8 @@ res_px = st.sidebar.select_slider("Display resolution (px)",
     options=[800, 1100, 1500, 2000, 2500], value=1500,
     help="Higher = sharper overlays and more solid built-up blocks, but slower.")
 
-
 lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
-
 
 v          = np.isfinite(delta)
 target_ids = {iv['target_class'] for iv in interventions} or {1}
@@ -273,7 +268,6 @@ c3.metric("Treated-pixel cooling",  f"{m_treat:.3f} °C")
 c4.metric("Target treated",         f"{pct_tr:.1f} %")
 st.caption(f"Strategy: **{strat_label}**  •  baseline city mean {np.nanmean(lst10):.2f} °C → "
            f"scenario {np.nanmean(lst_scn):.2f} °C  •  max local cooling {max_c:.2f} °C")
-
 
 tiles = None if basemap == "Esri.WorldImagery" else basemap
 fmap = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles=tiles, control_scale=True)
@@ -313,7 +307,6 @@ folium.LayerControl(collapsed=False).add_to(fmap)
 col_map, col_key = st.columns([4, 1])
 with col_map:
     st_folium(fmap, width=None, height=600, returned_objects=[])
-
 with col_key:
     st.markdown("#### Legends")
     if show_lc:
@@ -329,6 +322,8 @@ with col_key:
 
 with st.expander("ℹ️ How the scenario works"):
     st.write(
+        "- **5-class land cover** separates **Building/Roof** from **Road/Pavement**, so "
+        "green roofs and high-albedo paving apply to their correct surfaces.\n"
         "- **Target surface** — pick which land-cover class each intervention applies to.\n"
         "- **Selection strategy** — *Hottest first* treats the worst hotspots (best "
         "cooling per area); *Area-based* spreads treatment fairly so newer/cooler "
