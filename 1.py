@@ -275,7 +275,7 @@ elif layer == "LST scenario (°C)":
     folium.raster_layers.ImageOverlay(url, bounds=b, name=layer,
                                       opacity=opacity).add_to(fmap)
 else:
-    url, b = array_to_overlay(np.where(v, delta, np.nan), lst_prof, "Blues", 0, 2.5,
+    url, b = array_to_overlay(np.where(v & (delta > 0), delta, np.nan), lst_prof, "Blues", 0, 2.5,
                               False, key="delta"+scn_key, max_px=res_px)
     folium.raster_layers.ImageOverlay(url, bounds=b, name=layer,
                                       opacity=opacity).add_to(fmap)
