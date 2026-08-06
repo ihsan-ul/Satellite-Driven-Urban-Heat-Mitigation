@@ -1,4 +1,5 @@
 import os
+import gc
 import base64
 from io import BytesIO
 import numpy as np
@@ -12,7 +13,6 @@ from PIL import Image
 import folium
 from streamlit_folium import st_folium
 
-# ---- 5-CLASS SCHEME (Building/Roof and Road/Pavement now separate) --------
 CLASS_NAMES  = ["Vegetation", "Building/Roof", "Road/Pavement",
                 "Bare soil/Sand", "Water"]
 CLASS_COLORS = ["#1a9850", "#d73027", "#4d4d4d", "#fee08b", "#4575b4"]
@@ -28,7 +28,6 @@ COOL = {
 
 DATA_DIR = "data"
 
-# NOTE: after re-exporting the 5-class rasters, replace these with the NEW IDs.
 DRIVE_IDS = {
     "LANDCOVER_PRED_10M.tif": "1L9fEQwyLzQ8w83JGlMgLZSZcRa2no7N0",
     "LST_BASELINE_10M.tif":   "1Wwk10b0ZH-QpvEGnC8Hmfb4iPwScXeK5",
@@ -64,16 +63,21 @@ def ensure_files():
     return DATA_DIR
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=3)
 def load_array(path, nodata=None):
-    """Read band 1 as float32; return array, src profile, and lat/lon bounds."""
+
     with rasterio.open(path) as src:
-        arr = src.read(1).astype("float32")
+        raw = src.read(1)
         prof = {"crs": src.crs, "transform": src.transform,
                 "width": src.width, "height": src.height, "bounds": src.bounds}
         bounds4326 = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
-    if nodata is not None:
+    if nodata is not None and float(nodata) < 0:
+        arr = raw.astype("float32")
         arr = np.where(arr == nodata, np.nan, arr)
+    elif nodata is not None:
+        arr = raw.astype("int16")
+    else:
+        arr = raw.astype("float32")
     return arr, prof, bounds4326
 
 
@@ -112,7 +116,7 @@ def run_scenario(lst, lc, interventions):
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=6)
 def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     """_arr in the source CRS; `key` makes the cache unique per logical layer."""
     src_crs, src_transform = _prof["crs"], _prof["transform"]
@@ -152,8 +156,8 @@ def colorbar_png(cmap, vmin, vmax, label):
     grad = np.linspace(0, 1, 256).reshape(1, -1)
     ax.imshow(grad, aspect="auto", cmap=cmap, extent=[vmin, vmax, 0, 1])
     ax.set_yticks([]); ax.set_xlabel(label, fontsize=8); ax.tick_params(labelsize=7)
-    plt.tight_layout(pad=0.2)
-    buf = BytesIO(); fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
 
@@ -300,6 +304,9 @@ if show_delta:
                               False, key="delta"+scn_key, max_px=res_px)
     folium.raster_layers.ImageOverlay(url, bounds=b, name="Cooling Δ (°C)",
                                       opacity=opacity).add_to(fmap)
+
+del lst_scn, delta, v, in_targets, treated
+gc.collect()
 
 fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 folium.LayerControl(collapsed=False).add_to(fmap)
