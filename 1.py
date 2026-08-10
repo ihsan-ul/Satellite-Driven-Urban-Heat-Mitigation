@@ -35,10 +35,10 @@ STRATEGY  = "hottest"
 
 DATA_DIR = "data"
 DRIVE_IDS = {
-    "LANDCOVER_PRED_10M.tif": "1L9fEQwyLzQ8w83JGlMgLZSZcRa2no7N0",
-    "LST_BASELINE_10M.tif":   "1Wwk10b0ZH-QpvEGnC8Hmfb4iPwScXeK5",
-    "LST_SCENARIO_10M.tif":   "1TUiVdzFPSyI235ZJx3iR-4qzx6F0bHdE",
-    "LST_DELTA_10M.tif":      "1p9zeRWTlIdFGELMZZIOoKI7JW8za5WNj",
+    "LANDCOVER_PRED_10M.tif": "1H7rk7rs3cE3D3xZopofvphHa3eB56NCR",
+    "LST_BASELINE_10M.tif":   "1zNT-sk6j8zDwVcGI9sRLri5HVw9hRc07",
+    "LST_SCENARIO_10M.tif":   "1N5R4tsZQRz1uXVxk1dIkWN9nsmISIOcT",
+    "LST_DELTA_10M.tif":      "1JH35jeMDGOy95gvTcnr91g3JUACg76fX",
 }
 
 LC_FILE   = "LANDCOVER_PRED_10M.tif"
