@@ -1,5 +1,4 @@
-!pip -q install "earthengine-api>=1.4.0" geemap leafmap rasterio rioxarray \
-     geopandas localtileserver scikit-learn tensorflow tqdm matplotlib psutil
+!pip -q install "earthengine-api>=1.4.0" geemap leafmap rasterio rioxarray localtileserver scikit-learn tensorflow tqdm matplotlib psutil osmnx shapely
 
 import os, glob, time, warnings, gc, base64
 from io import BytesIO
@@ -23,14 +22,16 @@ except Exception:
 print("Earth Engine:", ee.String("ready").getInfo(), " project:", GEE_PROJECT)
 
 AOI  = ee.Geometry.Rectangle([55.10, 24.80, 55.55, 25.40])
+AOI_LONLAT = (55.10, 24.80, 55.55, 25.40)
 UTM  = "EPSG:32640"
-YEARS = list(range(2016, 2026))
+YEARS = list(range(2023, 2026))
 SUMMER_MONTHS = [6, 7, 8]
 S2_SCALE, LST_SCALE = 10, 30
 
-NUM_CLASSES  = 4
-CLASS_NAMES  = ["Vegetation", "Impervious/Built", "Bare soil/Sand", "Water"]
-CLASS_COLORS = ["#1a9850", "#d73027", "#fee08b", "#4575b4"]
+NUM_CLASSES  = 5
+CLASS_NAMES  = ["Vegetation", "Building/Roof", "Road/Pavement",
+                "Bare soil/Sand", "Water"]
+CLASS_COLORS = ["#1a9850", "#d73027", "#4d4d4d", "#fee08b", "#4575b4"]
 
 os.makedirs(LOCAL_DIR, exist_ok=True)
 if USE_DRIVE:
@@ -52,6 +53,7 @@ def prep_landsat(img):
            .subtract(273.15).rename('LST'))
     return lst.updateMask(clear).copyProperties(img, ['system:time_start'])
 
+
 def landsat_lst():
     merged = ee.ImageCollection([])
     for cid in ['LANDSAT/LC08/C02/T1_L2', 'LANDSAT/LC09/C02/T1_L2']:
@@ -61,6 +63,7 @@ def landsat_lst():
              .map(prep_landsat))
         merged = merged.merge(c)
     return merged.select('LST').median().clip(AOI).rename('LST')
+
 
 lst_baseline = landsat_lst()
 
@@ -81,12 +84,13 @@ def build_s2():
     ndwi = comp.normalizedDifference(['B3', 'B8']).rename('NDWI')
     return comp.addBands([ndvi, ndbi, ndwi])
 
+
 s2_features = build_s2()
 dem = ee.Image('USGS/SRTMGL1_003').select('elevation').clip(AOI).rename('elevation')
 
 wc = ee.ImageCollection('ESA/WorldCover/v200').first().select('Map')
 labels = wc.remap([10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100],
-                  [ 0,  0,  0,  0,  1,  2,  2,  3,  0,  0,   0]).rename('class').clip(AOI)
+                  [0,  0,  0,  0,  2,  3,  3,  4,  0,  0,   3]).rename('class').clip(AOI)
 
 FEAT_BANDS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDBI', 'NDWI', 'elevation']
 feat_stack = s2_features.addBands(dem).select(FEAT_BANDS).toFloat()
@@ -98,10 +102,11 @@ def export_drive(image, name, scale):
         fileNamePrefix=name, region=AOI, scale=scale, crs=UTM,
         maxPixels=int(1e13), fileFormat='GeoTIFF')
     task.start()
-    print(f"[{name}] batch export started (scale {scale} m)…", end='', flush=True)
+    print(f"[{name}] batch export started ({scale} m)...", end='', flush=True)
     while task.active():
         time.sleep(20); print(".", end='', flush=True)
     print(" ->", task.status().get('state'))
+
 
 def load_raster(name, retries=24, delay=5):
     pattern = os.path.join(OUT, name + '*.tif')
@@ -122,6 +127,7 @@ def load_raster(name, retries=24, delay=5):
     with rasterio.open(files[0]) as s:
         return s.read(), s.profile
 
+
 def get_layer(image, name, scale):
     if USE_DRIVE:
         export_drive(image, name, scale)
@@ -129,6 +135,7 @@ def get_layer(image, name, scale):
         geemap.download_ee_image(image, os.path.join(OUT, name + '.tif'),
                                  region=AOI, scale=scale, crs=UTM)
     return load_raster(name)
+
 
 _ = get_layer(feat_stack,   'S2_FEATURES_10M', S2_SCALE)
 _ = get_layer(labels,       'LABELS_10M',      S2_SCALE)
@@ -139,6 +146,69 @@ print("Exports finished.")
 feat_arr,  feat_prof  = load_raster('S2_FEATURES_10M')
 label_arr, label_prof = load_raster('LABELS_10M')
 lst30_arr, lst30_prof = load_raster('LST_30M')
+
+import osmnx as ox
+import geopandas as gpd
+from shapely.geometry import box
+from rasterio.features import rasterize
+
+ROAD_HALF_WIDTH = {
+    'motorway': 12, 'motorway_link': 8, 'trunk': 10, 'trunk_link': 7,
+    'primary': 9, 'primary_link': 6, 'secondary': 7, 'secondary_link': 5,
+    'tertiary': 6, 'residential': 4, 'living_street': 3, 'service': 3,
+    'unclassified': 4,
+}
+DEFAULT_HALF_WIDTH = 4
+
+
+def _first(x):
+    return x[0] if isinstance(x, list) else x
+
+
+def build_osm_masks(prof, aoi_lonlat):
+    west, south, east, north = aoi_lonlat
+    poly  = box(west, south, east, north)
+    H, W  = prof['height'], prof['width']
+    tform = prof['transform']
+    crs   = prof['crs']
+
+    tags_b = {'building': True}
+    gdf_b = ox.features_from_polygon(poly, tags_b)
+    gdf_b = gdf_b[gdf_b.geometry.type.isin(['Polygon', 'MultiPolygon'])].to_crs(crs)
+    building_mask = rasterize(
+        ((g, 1) for g in gdf_b.geometry),
+        out_shape=(H, W), transform=tform, fill=0, dtype='uint8').astype(bool)
+
+    tags_r = {'highway': True}
+    gdf_r = ox.features_from_polygon(poly, tags_r)
+    gdf_r = gdf_r[gdf_r.geometry.type.isin(['LineString', 'MultiLineString'])].to_crs(crs)
+    hw = gdf_r['highway'].map(lambda h: ROAD_HALF_WIDTH.get(_first(h), DEFAULT_HALF_WIDTH))
+    gdf_r = gdf_r.assign(buf=gdf_r.geometry.buffer(hw.values))
+    road_mask = rasterize(
+        ((g, 1) for g in gdf_r['buf']),
+        out_shape=(H, W), transform=tform, fill=0, dtype='uint8').astype(bool)
+
+    return building_mask, road_mask
+
+
+print("Refining labels with OpenStreetMap (buildings vs roads)...")
+lab = label_arr[0].astype('int16').copy()
+
+wc_builtup = (lab == 2)
+
+building_mask, road_mask = build_osm_masks(label_prof, AOI_LONLAT)
+
+lab[road_mask]     = 2
+lab[building_mask] = 1
+leftover_builtup = wc_builtup & ~road_mask & ~building_mask
+lab[leftover_builtup] = 1
+print(f"Reclassified {int(leftover_builtup.sum()):,} leftover built-up pixels "
+      f"from Road -> Building/Roof (FIX 1).")
+
+label_arr[0] = lab
+uniq, cnt = np.unique(lab, return_counts=True)
+print("Refined label balance:",
+      {CLASS_NAMES[u]: int(c) for u, c in zip(uniq, cnt) if u < NUM_CLASSES})
 
 BANDS = feat_arr.shape[0]
 H, W  = feat_arr.shape[1], feat_arr.shape[2]
@@ -157,12 +227,24 @@ Xn = X
 np.save(os.path.join(OUT, 'feat_mean.npy'), mean)
 np.save(os.path.join(OUT, 'feat_std.npy'),  std)
 
+
+uniq, cnt = np.unique(Y[valid], return_counts=True)
+freq = np.zeros(NUM_CLASSES, 'float64')
+freq[uniq] = cnt / cnt.sum()
+CLS_W = np.where(freq > 0, 1.0 / (freq + 1e-6), 0.0)
+CLS_W = (CLS_W / CLS_W[freq > 0].mean()).astype('float32')
+print("Class weights (FIX 2):", {CLASS_NAMES[i]: round(float(CLS_W[i]), 2)
+                                  for i in range(NUM_CLASSES)})
+
 PATCH, STRIDE = 256, 192
+
+
 def starts(n, p, s):
     xs = list(range(0, max(1, n - p + 1), s))
     if n > p and xs[-1] != n - p:
         xs.append(n - p)
     return xs
+
 
 def make_patches(img, msk, lab):
     xs, ys, ws = [], [], []
@@ -171,12 +253,15 @@ def make_patches(img, msk, lab):
             mm = msk[r:r+PATCH, c:c+PATCH]
             if mm.shape != (PATCH, PATCH) or mm.mean() < 0.25:
                 continue
+            lb = lab[r:r+PATCH, c:c+PATCH]
+            w  = mm.astype('float32') * CLS_W[np.clip(lb, 0, NUM_CLASSES-1)]
             xs.append(img[r:r+PATCH, c:c+PATCH, :])
-            ys.append(lab[r:r+PATCH, c:c+PATCH])
-            ws.append(mm)
+            ys.append(lb)
+            ws.append(w)
     return (np.asarray(xs, 'float16'),
             np.asarray(ys, 'uint8'),
             np.asarray(ws, 'float16'))
+
 
 split = int(W * 0.75)
 Xtr, Ytr, Wtr = make_patches(Xn[:, :split], valid[:, :split], Y[:, :split])
@@ -203,12 +288,14 @@ if USE_MIXED_PRECISION:
     mixed_precision.set_global_policy('mixed_float16')
     print("Mixed precision enabled (float16 compute, float32 softmax).")
 
+
 def conv_block(x, f):
     for _ in range(2):
         x = layers.Conv2D(f, 3, padding='same', use_bias=False)(x)
         x = layers.BatchNormalization()(x)
         x = layers.Activation('relu')(x)
     return x
+
 
 def build_unet(bands, nclass, base=32):
     inp = layers.Input((None, None, bands))
@@ -228,9 +315,24 @@ def build_unet(bands, nclass, base=32):
     out = layers.Conv2D(nclass, 1, activation='softmax', dtype='float32')(c8)
     return Model(inp, out)
 
+
+
+def dice_ce_loss(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.int32)
+    ce = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred)
+    ce = tf.reduce_mean(ce)
+
+    yt = tf.one_hot(y_true, NUM_CLASSES)
+    yt = tf.cast(yt, y_pred.dtype)
+    inter = tf.reduce_sum(yt * y_pred, axis=[1, 2])
+    union = tf.reduce_sum(yt + y_pred, axis=[1, 2])
+    dice  = 1.0 - tf.reduce_mean((2.0 * inter + 1e-6) / (union + 1e-6))
+    return ce + dice
+
+
 model = build_unet(BANDS, NUM_CLASSES)
 model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
-              loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+              loss=dice_ce_loss, metrics=['accuracy'])
 print("Params:", f"{model.count_params():,}")
 
 cbs = [tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True, monitor='val_loss'),
@@ -242,32 +344,42 @@ model.save(os.path.join(OUT, 'unet_dubai.keras'))
 print("Model saved to", os.path.join(OUT, 'unet_dubai.keras'))
 del Xtr, Ytr, Wtr; gc.collect()
 
-from sklearn.metrics import f1_score, jaccard_score, confusion_matrix
-import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, f1_score
 
-pv   = model.predict(Xva, batch_size=4).argmax(-1)
-mask = Wva.astype(bool)
-yt, yp = Yva[mask], pv[mask]
-iou = jaccard_score(yt, yp, average=None, labels=range(NUM_CLASSES))
-f1  = f1_score(yt, yp, average=None, labels=range(NUM_CLASSES))
+y_true_all, y_pred_all = [], []
+EVAL_BATCH = 4
+for i in range(0, len(Xva), EVAL_BATCH):
+    xb   = Xva[i:i+EVAL_BATCH].astype('float32')
+    pred = model.predict(xb, verbose=0).argmax(-1).astype('uint8')
+    yb   = Yva[i:i+EVAL_BATCH].astype('uint8')
+    wb   = Wva[i:i+EVAL_BATCH].astype('float32') > 0
+    y_true_all.append(yb[wb])
+    y_pred_all.append(pred[wb])
 
-print(f"{'Class':18s}{'IoU':>8s}{'F1':>8s}")
-for i, n in enumerate(CLASS_NAMES):
-    print(f"{n:18s}{iou[i]:8.3f}{f1[i]:8.3f}")
-print("-" * 34)
-print(f"mean IoU = {iou.mean():.3f}   macro-F1 = {f1_score(yt,yp,average='macro'):.3f}   "
-      f"OA = {(yt==yp).mean():.3f}")
+y_true = np.concatenate(y_true_all)
+y_pred = np.concatenate(y_pred_all)
+del y_true_all, y_pred_all; gc.collect()
 
-cm = confusion_matrix(yt, yp, labels=range(NUM_CLASSES), normalize='true')
-plt.figure(figsize=(5, 4)); plt.imshow(cm, cmap='Blues', vmin=0, vmax=1)
-plt.xticks(range(NUM_CLASSES), CLASS_NAMES, rotation=45, ha='right')
-plt.yticks(range(NUM_CLASSES), CLASS_NAMES)
-for i in range(NUM_CLASSES):
-    for j in range(NUM_CLASSES):
-        plt.text(j, i, f"{cm[i,j]:.2f}", ha='center', va='center')
-plt.title('Normalised confusion matrix'); plt.colorbar(); plt.tight_layout()
-plt.savefig(os.path.join(OUT, 'confusion_matrix.png'), dpi=120); plt.show()
-del pv, mask, yt, yp, Xva, Yva, Wva; gc.collect()
+_labels = np.arange(NUM_CLASSES)
+cm      = confusion_matrix(y_true, y_pred, labels=_labels)
+inter = np.diag(cm).astype('float64')
+union = cm.sum(0) + cm.sum(1) - inter
+iou   = np.where(union > 0, inter / union, np.nan)
+f1_per = f1_score(y_true, y_pred, labels=_labels, average=None, zero_division=0)
+
+print("\n===== U-Net validation metrics (patch-level) =====")
+print(f"{'Class':<16}{'IoU':>8}{'F1':>8}")
+for i, name in enumerate(CLASS_NAMES):
+    print(f"{name:<16}{iou[i]:>8.3f}{f1_per[i]:>8.3f}")
+print("-" * 32)
+print(f"{'mIoU':<16}{np.nanmean(iou):>8.3f}")
+print(f"{'Macro-F1':<16}{f1_per.mean():>8.3f}")
+print(f"{'Pixel accuracy':<16}{np.trace(cm)/cm.sum():>8.3f}")
+
+_target = 0.57
+print(f"\nBenchmark (proposal §2.4.3): mIoU > 57%  ->  "
+      f"{'PASS' if np.nanmean(iou) > _target else 'BELOW TARGET'}")
+del y_true, y_pred, cm; gc.collect()
 
 prob = np.zeros((H, W, NUM_CLASSES), 'float32'); cnt = np.zeros((H, W), 'float32')
 for r in starts(H, PATCH, STRIDE):
@@ -277,6 +389,61 @@ for r in starts(H, PATCH, STRIDE):
         cnt[r:r+PATCH,  c:c+PATCH] += 1
 prob /= np.maximum(cnt[..., None], 1)
 landcover = prob.argmax(-1).astype('uint8'); landcover[~valid] = 255
+
+if 'building_mask' not in globals() or 'road_mask' not in globals():
+    print("Rebuilding OSM masks for the override...")
+    building_mask, road_mask = build_osm_masks(feat_prof, AOI_LONLAT)
+
+landcover[road_mask     & valid] = 2
+landcover[building_mask & valid] = 1
+
+print("OSM authority override applied.")
+_ufr = {CLASS_NAMES[i]: round(float((landcover == i).sum()) / max(1, valid.sum()), 3)
+        for i in range(NUM_CLASSES)}
+print("Post-override class fractions:", _ufr)
+
+import matplotlib.pyplot as plt
+
+val_cols = np.zeros(W, bool); val_cols[split:] = True
+val_mask = valid & val_cols[None, :] & (landcover != 255)
+
+yt_dep = Y[val_mask].astype('uint8')
+yp_dep = landcover[val_mask].astype('uint8')
+
+cm_dep   = confusion_matrix(yt_dep, yp_dep, labels=_labels)
+inter_d  = np.diag(cm_dep).astype('float64')
+union_d  = cm_dep.sum(0) + cm_dep.sum(1) - inter_d
+iou_dep  = np.where(union_d > 0, inter_d / union_d, np.nan)
+f1_dep   = f1_score(yt_dep, yp_dep, labels=_labels, average=None, zero_division=0)
+
+print("\n===== As-deployed metrics (post-OSM override, validation cols) =====")
+print(f"{'Class':<16}{'IoU':>8}{'F1':>8}")
+for i, name in enumerate(CLASS_NAMES):
+    print(f"{name:<16}{iou_dep[i]:>8.3f}{f1_dep[i]:>8.3f}")
+print("-" * 32)
+print(f"{'mIoU':<16}{np.nanmean(iou_dep):>8.3f}")
+print(f"{'Macro-F1':<16}{f1_dep.mean():>8.3f}")
+print(f"{'Pixel accuracy':<16}{np.trace(cm_dep)/cm_dep.sum():>8.3f}")
+
+cm_norm = cm_dep.astype('float64') / cm_dep.sum(axis=1, keepdims=True).clip(min=1)
+fig, ax = plt.subplots(figsize=(6.5, 5.5))
+im = ax.imshow(cm_norm, cmap='Blues', vmin=0, vmax=1)
+ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+ax.set_xticklabels(CLASS_NAMES, rotation=45, ha='right')
+ax.set_yticklabels(CLASS_NAMES)
+ax.set_xlabel('Predicted class'); ax.set_ylabel('True class')
+ax.set_title('As-deployed Confusion Matrix (post-OSM override, row-normalised)')
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        ax.text(j, i, f"{cm_norm[i, j]:.2f}\n({cm_dep[i, j]:,})",
+                ha='center', va='center', fontsize=8,
+                color='white' if cm_norm[i, j] > 0.5 else 'black')
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).set_label('Proportion of true-class pixels')
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, 'confusion_matrix_deployed.png'), dpi=150, bbox_inches='tight')
+plt.show()
+print("Saved confusion_matrix_deployed.png to", OUT)
+del yt_dep, yp_dep, cm_dep, cm_norm; gc.collect()
 
 prof_lc = feat_prof.copy(); prof_lc.update(count=1, dtype='uint8', nodata=255)
 with rasterio.open(os.path.join(OUT, 'LANDCOVER_PRED_10M.tif'), 'w', **prof_lc) as d:
@@ -290,7 +457,10 @@ del prob, cnt; gc.collect()
 from rasterio.warp import reproject, Resampling
 from sklearn.ensemble import RandomForestRegressor
 
+
 def bidx(name): return FEAT_BANDS.index(name)
+
+
 print("H,W =", H, W, " total 10 m px =", f"{H*W:,}", " NUM_CLASSES =", NUM_CLASSES)
 
 P10 = np.stack([X[..., bidx('NDVI')], X[..., bidx('NDBI')],
@@ -317,7 +487,7 @@ del agg_pred; gc.collect()
 print("30 m train grid =", lst30.shape, " valid train rows =", f"{int(ok.sum()):,}")
 
 Xok, yok = Ptr[ok], ytr[ok]
-print(f"Training on ALL {Xok.shape} valid 30 m rows")
+print(f"Training on ALL {Xok.shape[0]:,} valid 30 m rows")
 
 rf = RandomForestRegressor(
     n_estimators=200, max_depth=20, max_samples=0.3, max_features=0.5,
@@ -361,6 +531,60 @@ with rasterio.open(os.path.join(OUT, 'LST_BASELINE_10M.tif'), 'w', **prof1) as d
 print("Saved LST_BASELINE_10M.tif")
 del back, mm; gc.collect()
 
+!pip -q install osmnx shapely
+
+import osmnx as ox
+from shapely.geometry import box
+from rasterio.features import rasterize
+
+ROAD_HALF_WIDTH = {
+    'motorway': 12, 'motorway_link': 8, 'trunk': 10, 'trunk_link': 7,
+    'primary': 9, 'primary_link': 6, 'secondary': 7, 'secondary_link': 5,
+    'tertiary': 6, 'residential': 4, 'living_street': 3, 'service': 3,
+    'unclassified': 4}
+DEFAULT_HALF_WIDTH = 4
+_first = lambda x: x[0] if isinstance(x, list) else x
+
+
+def load1(name):
+    f = sorted(glob.glob(os.path.join(OUT, name + '*.tif')))
+    assert f, f"missing {name} in {OUT}"
+    with rasterio.open(f[0]) as s:
+        return s.read(1), s.profile, f[0]
+
+
+def build_osm_masks(prof):
+    poly  = box(*AOI_LONLAT)
+    H, W  = prof['height'], prof['width']
+    tform, crs = prof['transform'], prof['crs']
+
+    tags_b = {'building': True}
+    gdf_b = ox.features_from_polygon(poly, tags_b)
+    gdf_b = gdf_b[gdf_b.geometry.type.isin(['Polygon', 'MultiPolygon'])].to_crs(crs)
+    building_mask = rasterize(
+        ((g, 1) for g in gdf_b.geometry),
+        out_shape=(H, W), transform=tform, fill=0, dtype='uint8').astype(bool)
+
+    tags_r = {'highway': True}
+    gdf_r = ox.features_from_polygon(poly, tags_r)
+    gdf_r = gdf_r[gdf_r.geometry.type.isin(['LineString', 'MultiLineString'])].to_crs(crs)
+    hw = gdf_r['highway'].map(lambda h: ROAD_HALF_WIDTH.get(_first(h), DEFAULT_HALF_WIDTH))
+    gdf_r = gdf_r.assign(buf=gdf_r.geometry.buffer(hw.values))
+    road_mask = rasterize(
+        ((g, 1) for g in gdf_r['buf']),
+        out_shape=(H, W), transform=tform, fill=0, dtype='uint8').astype(bool)
+    return building_mask, road_mask
+
+
+pred, pred_prof, pred_path = load1('LANDCOVER_PRED_10M')
+pred = pred.astype('int16')
+valid = (pred != 255)
+landcover = pred
+
+lst_arr, lst_prof, lst_path = load1('LST_BASELINE_10M')
+lst10 = lst_arr.astype('float32')
+lst10 = np.where(lst10 == -9999.0, np.nan, lst10)
+
 COOL = {
     'green_roof':           1.45,
     'green_roof_hotarid':   1.83,
@@ -368,6 +592,7 @@ COOL = {
     'high_albedo_pavement': 2.50,
     'veg_buffer':           1.00,
 }
+
 
 def run_scenario(lst, lc, interventions):
     out  = lst.copy().astype('float32')
@@ -384,149 +609,56 @@ def run_scenario(lst, lc, interventions):
         done[rr, cc] = True
     return out
 
+
 interventions = [
     {'name': 'green_roof_hotarid',   'fraction': 0.20, 'target_class': 1},
-    {'name': 'high_albedo_pavement', 'fraction': 0.30, 'target_class': 1},
+    {'name': 'high_albedo_pavement', 'fraction': 0.30, 'target_class': 2},
 ]
 
 lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
 
-with rasterio.open(os.path.join(OUT, 'LST_SCENARIO_10M.tif'), 'w', **prof1) as d:
-    d.write(lst_scn, 1)
-with rasterio.open(os.path.join(OUT, 'LST_DELTA_10M.tif'), 'w', **prof1) as d:
-    d.write(np.nan_to_num(delta), 1)
+prof1 = lst_prof.copy(); prof1.update(count=1, dtype='float32', nodata=-9999.0,
+                                      compress='deflate')
+
+
+def save_nodata(path, arr):
+    a = np.where(np.isnan(arr), -9999.0, arr).astype('float32')
+    with rasterio.open(path, 'w', **prof1) as d:
+        d.write(a, 1)
+
+
+save_nodata(os.path.join(OUT, 'LST_SCENARIO_10M.tif'), lst_scn)
+save_nodata(os.path.join(OUT, 'LST_DELTA_10M.tif'),    delta)
 
 v       = np.isfinite(delta)
-built   = (landcover == 1) & v
-treated = built & (delta > 0)
-print(f"City mean LST baseline      : {np.nanmean(lst10):.2f} °C")
+roofs   = (landcover == 1) & v
+roads   = (landcover == 2) & v
+treated = (roofs | roads) & (delta > 0)
+print(f"\nCity mean LST baseline      : {np.nanmean(lst10):.2f} °C")
 print(f"City mean LST scenario      : {np.nanmean(lst_scn):.2f} °C")
 print(f"Mean cooling (whole AOI)    : {np.nanmean(delta[v]):.3f} °C")
-print(f"Mean cooling (built-up)     : {np.nanmean(delta[built]):.3f} °C")
+print(f"Mean cooling (roofs)        : {np.nanmean(delta[roofs]):.3f} °C")
+print(f"Mean cooling (roads)        : {np.nanmean(delta[roads]):.3f} °C")
 print(f"Mean cooling (treated only) : {np.nanmean(delta[treated]):.3f} °C")
-print(f"Built-up pixels treated     : {treated.sum():,} / {built.sum():,} "
-      f"({100*treated.sum()/max(1,built.sum()):.1f}%)")
+print(f"Treated pixels              : {treated.sum():,} / {(roofs|roads).sum():,} "
+      f"({100*treated.sum()/max(1,(roofs|roads).sum()):.1f}%)")
 print(f"Max local cooling           : {np.nanmax(delta[v]):.2f} °C")
-print("Saved LST_SCENARIO_10M.tif and LST_DELTA_10M.tif")
-del lst_scn; gc.collect()
+print("\nSaved LST_SCENARIO_10M.tif and LST_DELTA_10M.tif")
+
+import matplotlib.pyplot as plt
 
 fr = np.linspace(0, 1, 11)
 plt.figure(figsize=(7, 4))
 for iv in interventions:
     curve = [np.nanmean(lst10 - run_scenario(
-                lst10, landcover,
-                [{'name': iv['name'], 'fraction': f, 'target_class': iv['target_class']}]))
-             for f in fr]
+        lst10, landcover, [
+            {'name': iv['name'], 'fraction': f, 'target_class': iv['target_class']}]))
+        for f in fr]
     plt.plot(fr * 100, curve, 'o-',
-             label=f"{iv['name']} → class {iv['target_class']}")
+             label=f"{iv['name']} → {CLASS_NAMES[iv['target_class']]}")
 plt.xlabel('% of target surface treated')
 plt.ylabel('City-wide mean cooling (°C)')
 plt.title('Sensitivity of city cooling to intervention intensity')
 plt.legend(); plt.grid(True); plt.tight_layout()
 plt.savefig(os.path.join(OUT, 'sensitivity.png'), dpi=120); plt.show()
-
-def fix_nan_nodata(path, nodata=-9999.0):
-    with rasterio.open(path) as src:
-        data = src.read(1)
-        profile = src.profile.copy()
-    data = np.where(np.isnan(data), nodata, data).astype('float32')
-    profile.update(dtype='float32', nodata=nodata, compress='deflate')
-    with rasterio.open(path, 'w', **profile) as dst:
-        dst.write(data, 1)
-    with rasterio.open(path) as chk:
-        print(f"{os.path.basename(path):26s} nodata={nodata} hasNaN={np.isnan(chk.read(1)).any()}")
-
-for f in ['LST_BASELINE_10M.tif', 'LST_SCENARIO_10M.tif', 'LST_DELTA_10M.tif']:
-    fix_nan_nodata(os.path.join(OUT, f))
-
-import shutil
-LOCAL = '/content/UHI_Dubai'; os.makedirs(LOCAL, exist_ok=True)
-for f in os.listdir(OUT):
-    if f.endswith('.tif'):
-        shutil.copy(os.path.join(OUT, f), os.path.join(LOCAL, f))
-print("copied to", LOCAL)
-
-import leafmap
-from ipyleaflet import ImageOverlay
-from PIL import Image
-from matplotlib.colors import ListedColormap
-from rasterio.warp import transform_bounds, calculate_default_transform
-
-SRC = LOCAL
-LC_CMAP = ListedColormap(CLASS_COLORS)
-
-def raster_to_overlay(path, cmap, vmin=None, vmax=None, nodata=None,
-                      discrete=False, max_px=2000):
-    with rasterio.open(path) as src:
-        dst_crs = "EPSG:4326"
-        transform, w, h = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds)
-        scale = min(1.0, max_px / max(w, h))
-        w, h = max(1, int(w * scale)), max(1, int(h * scale))
-        transform, w, h = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds,
-            dst_width=w, dst_height=h)
-        data = np.full((h, w), np.nan, "float32")
-        reproject(
-            source=src.read(1), destination=data,
-            src_transform=src.transform, src_crs=src.crs,
-            dst_transform=transform, dst_crs=dst_crs,
-            src_nodata=nodata, dst_nodata=np.nan,
-            resampling=Resampling.nearest if discrete else Resampling.bilinear)
-        left, bottom, right, top = transform_bounds(src.crs, dst_crs, *src.bounds)
-
-    alpha = np.isfinite(data)
-    if nodata is not None:
-        alpha &= (data != nodata)
-
-    if discrete:
-        idx = np.clip(np.nan_to_num(data, nan=0).astype(int), 0, len(CLASS_COLORS) - 1)
-        rgba = (LC_CMAP(idx / max(1, len(CLASS_COLORS) - 1)) * 255).astype("uint8")
-    else:
-        norm = np.clip((data - vmin) / (vmax - vmin + 1e-9), 0, 1)
-        rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
-
-    rgba[..., 3] = np.where(alpha, 255, 0)
-    buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
-    url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    bounds = [[bottom, left], [top, right]]
-    return url, bounds
-
-specs = [
-    dict(f="LANDCOVER_PRED_10M.tif", name="U-Net land cover",
-         cmap=None, discrete=True, nodata=255),
-    dict(f="LST_BASELINE_10M.tif",   name="LST baseline (°C)",
-         cmap="inferno", vmin=30, vmax=58, nodata=-9999.0),
-    dict(f="LST_SCENARIO_10M.tif",   name="LST scenario (°C)",
-         cmap="inferno", vmin=30, vmax=58, nodata=-9999.0),
-    dict(f="LST_DELTA_10M.tif",      name="Cooling Δ (°C)",
-         cmap="Blues", vmin=0, vmax=2.5, nodata=-9999.0),
-]
-
-m = leafmap.Map(center=[25.10, 55.30], zoom=10)
-m.add_basemap("HYBRID")
-
-first = True
-for s in specs:
-    path = os.path.join(SRC, s["f"])
-    if not os.path.exists(path):
-        print(f"missing {s['f']}"); continue
-    url, bounds = raster_to_overlay(
-        path, s["cmap"], s.get("vmin"), s.get("vmax"),
-        s.get("nodata"), s.get("discrete", False))
-    ov = ImageOverlay(url=url, bounds=bounds, name=s["name"])
-    m.add_layer(ov)
-    if first:
-        m.fit_bounds(bounds); first = False
-    print(f"added {s['name']}  bounds={bounds}")
-
-legend = {n: c for n, c in zip(CLASS_NAMES, CLASS_COLORS)}
-m.add_legend(title="Land cover", legend_dict=legend)
-try:
-    m.add_colorbar(cmap="inferno", vmin=30, vmax=58, label="LST (°C)")
-except TypeError:
-    cols = [plt.get_cmap("inferno")(i/9) for i in range(10)]
-    m.add_colorbar(colors=cols, vmin=30, vmax=58, label="LST (°C)")
-m.add_layer_control()
-m
