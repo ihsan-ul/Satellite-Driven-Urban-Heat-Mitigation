@@ -26,19 +26,19 @@ COOL = {
     'veg_buffer':           1.00,
 }
 
-
 GR_TARGET = CLASS_INDEX["Building/Roof"]
 AL_TARGET = CLASS_INDEX["Road/Pavement"]
 VB_TARGET = CLASS_INDEX["Bare soil/Sand"]
-STRATEGY  = "area"
+
+
+STRATEGY  = "hottest"
 
 DATA_DIR = "data"
-
 DRIVE_IDS = {
-    "LANDCOVER_PRED_10M.tif": "1L9fEQwyLzQ8w83JGlMgLZSZcRa2no7N0",
-    "LST_BASELINE_10M.tif":   "1Wwk10b0ZH-QpvEGnC8Hmfb4iPwScXeK5",
-    "LST_SCENARIO_10M.tif":   "1TUiVdzFPSyI235ZJx3iR-4qzx6F0bHdE",
-    "LST_DELTA_10M.tif":      "1p9zeRWTlIdFGELMZZIOoKI7JW8za5WNj",
+    "LANDCOVER_PRED_10M.tif": "1H7rk7rs3cE3D3xZopofvphHa3eB56NCR",
+    "LST_BASELINE_10M.tif":   "1zNT-sk6j8zDwVcGI9sRLri5HVw9hRc07",
+    "LST_SCENARIO_10M.tif":   "1N5R4tsZQRz1uXVxk1dIkWN9nsmISIOcT",
+    "LST_DELTA_10M.tif":      "1JH35jeMDGOy95gvTcnr91g3JUACg76fX",
 }
 
 LC_FILE   = "LANDCOVER_PRED_10M.tif"
@@ -86,7 +86,7 @@ def run_scenario(lst, lc, interventions):
     rng  = np.random.default_rng(0)
     for iv in interventions:
         coef, frac, tgt = COOL[iv['name']], iv['fraction'], iv['target_class']
-        strat = iv.get('strategy', 'area')
+        strat = iv.get('strategy', 'hottest')
         cand  = (lc == tgt) & np.isfinite(out) & (~done)
         idx   = np.where(cand.ravel())[0]
         if idx.size == 0 or frac <= 0:
@@ -94,7 +94,9 @@ def run_scenario(lst, lc, interventions):
         n = int(frac * idx.size)
         if n <= 0:
             continue
-        if strat == 'coolest':
+        if strat == 'hottest':
+            order = idx[np.argsort(-out.ravel()[idx])][:n]
+        elif strat == 'coolest':
             order = idx[np.argsort(out.ravel()[idx])][:n]
         else:
             order = rng.choice(idx, size=n, replace=False)
@@ -116,7 +118,6 @@ def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     w, h = max(1, int(w * scale)), max(1, int(h * scale))
     transform, w, h = calculate_default_transform(
         src_crs, dst_crs, src_w, src_h, *bounds, dst_width=w, dst_height=h)
-
     data = np.full((h, w), np.nan, "float32")
     reproject(source=np.ascontiguousarray(_arr), destination=data,
               src_transform=src_transform, src_crs=src_crs,
@@ -124,7 +125,6 @@ def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
               src_nodata=np.nan, dst_nodata=np.nan,
               resampling=Resampling.nearest if discrete else Resampling.bilinear)
     left, bottom, right, top = transform_bounds(src_crs, dst_crs, *bounds)
-
     alpha = np.isfinite(data)
     if discrete:
         idx = np.clip(np.nan_to_num(data, nan=0).astype(int), 0, len(CLASS_COLORS)-1)
@@ -133,7 +133,6 @@ def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
         norm = np.clip((data - vmin) / (vmax - vmin + 1e-9), 0, 1)
         rgba = (plt.get_cmap(cmap)(np.nan_to_num(norm)) * 255).astype("uint8")
     rgba[..., 3] = np.where(alpha, 255, 0)
-
     buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
     url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
     return url, [[bottom, left], [top, right]]
@@ -162,8 +161,8 @@ def land_cover_legend_html():
 
 
 st.set_page_config(page_title="Dubai Urban Heat Mitigation", layout="wide")
-st.title("🛰️ Satellite-Driven Urban Heat Mitigation — Dubai")
-st.caption("Green roofs → rooftops • High-albedo paving → roads. Set the intensity of each intervention.")
+st.title("\U0001F6F0\ufe0f Satellite-Driven Urban Heat Mitigation \u2014 Dubai")
+st.caption("Green roofs \u2192 rooftops \u2022 High-albedo paving \u2192 roads. Set the intensity of each intervention.")
 
 data_dir = ensure_files()
 lc_path, lst_path = os.path.join(data_dir, LC_FILE), os.path.join(data_dir, LST_FILE)
@@ -176,23 +175,31 @@ landcover, lc_prof, bounds = load_array(lc_path, nodata=255)
 landcover = np.nan_to_num(landcover, nan=255).astype("int16")
 lst10, lst_prof, _         = load_array(lst_path, nodata=-9999.0)
 
-st.sidebar.header("🎛️ Scenario controls")
+st.sidebar.header("\U0001F39B\ufe0f Scenario controls")
 
-st.sidebar.markdown("**Green roofs** → Building/Roof")
+st.sidebar.markdown("**Green roofs** \u2192 Building/Roof")
 gr_on   = st.sidebar.checkbox("Enable green roofs", value=True)
 gr_frac = st.sidebar.slider("Green-roof coverage (%)", 0, 100, 20, 5) / 100
-gr_coef = st.sidebar.select_slider("Green-roof coefficient (°C)",
+gr_coef = st.sidebar.select_slider("Green-roof coefficient (\u00b0C)",
                                    options=[1.0, 1.45, 1.83, 2.0], value=1.83)
 
-st.sidebar.markdown("**High-albedo paving** → Road/Pavement")
+st.sidebar.markdown("**High-albedo paving** \u2192 Road/Pavement")
 al_on   = st.sidebar.checkbox("Enable high-albedo paving", value=True)
 al_frac = st.sidebar.slider("Albedo coverage (%)", 0, 100, 30, 5) / 100
-al_coef = st.sidebar.select_slider("Albedo coefficient (°C)",
+al_coef = st.sidebar.select_slider("Albedo coefficient (\u00b0C)",
                                    options=[1.5, 2.0, 2.5, 3.0], value=2.5)
 
-st.sidebar.markdown("**Vegetation buffers** → Bare soil/Sand")
+st.sidebar.markdown("**Vegetation buffers** \u2192 Bare soil/Sand")
 vb_on   = st.sidebar.checkbox("Enable veg buffers", value=False)
 vb_frac = st.sidebar.slider("Veg-buffer coverage (%)", 0, 100, 0, 5) / 100
+
+st.sidebar.markdown("**Targeting strategy**")
+strategy = st.sidebar.radio(
+    "Which target pixels get treated first?",
+    ["hottest", "coolest", "area"],
+    index=0,
+    help="'hottest' treats the worst heat-offender surfaces first (matches the "
+         "Colab pipeline). 'area' picks pixels at random.")
 
 COOL['green_roof_hotarid']   = gr_coef
 COOL['high_albedo_pavement'] = al_coef
@@ -200,25 +207,25 @@ COOL['high_albedo_pavement'] = al_coef
 interventions = []
 if gr_on and gr_frac > 0:
     interventions.append({'name': 'green_roof_hotarid', 'fraction': gr_frac,
-                          'target_class': GR_TARGET, 'strategy': STRATEGY})
+                          'target_class': GR_TARGET, 'strategy': strategy})
 if al_on and al_frac > 0:
     interventions.append({'name': 'high_albedo_pavement', 'fraction': al_frac,
-                          'target_class': AL_TARGET, 'strategy': STRATEGY})
+                          'target_class': AL_TARGET, 'strategy': strategy})
 if vb_on and vb_frac > 0:
     interventions.append({'name': 'veg_buffer', 'fraction': vb_frac,
-                          'target_class': VB_TARGET, 'strategy': STRATEGY})
+                          'target_class': VB_TARGET, 'strategy': strategy})
 
 st.sidebar.divider()
-st.sidebar.header("🗺️ Display layer")
+st.sidebar.header("\U0001F5FA\ufe0f Display layer")
 layer = st.sidebar.radio(
     "Show one layer",
-    ["Cooling Δ (°C)", "LST scenario (°C)", "LST baseline (°C)", "U-Net land cover"],
+    ["Cooling \u0394 (\u00b0C)", "LST scenario (\u00b0C)", "LST baseline (\u00b0C)", "U-Net land cover"],
     index=0)
 basemap = st.sidebar.selectbox("Basemap",
                                ["Esri.WorldImagery", "OpenStreetMap", "CartoDB positron"])
 
 st.sidebar.divider()
-st.sidebar.header("🎨 Appearance")
+st.sidebar.header("\U0001F3A8 Appearance")
 opacity = st.sidebar.slider("Layer opacity", 0.0, 1.0, 0.85, 0.05,
     help="Raise toward 1.0 so the basemap stops bleeding through gaps between buildings.")
 res_px = st.sidebar.select_slider("Display resolution (px)",
@@ -232,21 +239,22 @@ v          = np.isfinite(delta)
 target_ids = {iv['target_class'] for iv in interventions} or {1}
 in_targets = np.isin(landcover, list(target_ids)) & v
 treated    = in_targets & (delta > 0)
+
 m_all   = float(np.nanmean(delta[v]))            if v.any()          else 0.0
 m_tgt   = float(np.nanmean(delta[in_targets]))   if in_targets.any() else 0.0
 m_treat = float(np.nanmean(delta[treated]))      if treated.any()    else 0.0
 max_c   = float(np.nanmax(delta[v]))             if v.any()          else 0.0
 pct_tr  = 100 * treated.sum() / max(1, in_targets.sum())
 
-st.subheader("📊 Live scenario metrics")
+st.subheader("\U0001F4CA Live scenario metrics")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("City-wide mean cooling", f"{m_all:.3f} °C")
-c2.metric("Target-surface cooling", f"{m_tgt:.3f} °C",
+c1.metric("City-wide mean cooling", f"{m_all:.3f} \u00b0C")
+c2.metric("Target-surface cooling", f"{m_tgt:.3f} \u00b0C",
           help="Mean cooling over the surface(s) you targeted (excludes untreated classes).")
-c3.metric("Treated-pixel cooling",  f"{m_treat:.3f} °C")
+c3.metric("Treated-pixel cooling",  f"{m_treat:.3f} \u00b0C")
 c4.metric("Target treated",         f"{pct_tr:.1f} %")
-st.caption(f"Baseline city mean {np.nanmean(lst10):.2f} °C → "
-           f"scenario {np.nanmean(lst_scn):.2f} °C  •  max local cooling {max_c:.2f} °C")
+st.caption(f"Baseline city mean {np.nanmean(lst10):.2f} \u00b0C \u2192 "
+           f"scenario {np.nanmean(lst_scn):.2f} \u00b0C  \u2022  max local cooling {max_c:.2f} \u00b0C")
 
 tiles = None if basemap == "Esri.WorldImagery" else basemap
 fmap = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, tiles=tiles, control_scale=True)
@@ -256,7 +264,7 @@ if basemap == "Esri.WorldImagery":
               "World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri", name="Esri.WorldImagery").add_to(fmap)
 
-scn_key = (f"{STRATEGY}{gr_on}{gr_frac}{gr_coef}"
+scn_key = (f"{strategy}{gr_on}{gr_frac}{gr_coef}"
            f"{al_on}{al_frac}{al_coef}{vb_on}{vb_frac}{res_px}")
 
 if layer == "U-Net land cover":
@@ -264,12 +272,12 @@ if layer == "U-Net land cover":
                               None, None, None, True, key=f"lc{res_px}", max_px=res_px)
     folium.raster_layers.ImageOverlay(url, bounds=b, name=layer,
                                       opacity=opacity).add_to(fmap)
-elif layer == "LST baseline (°C)":
+elif layer == "LST baseline (\u00b0C)":
     url, b = array_to_overlay(lst10, lst_prof, "inferno", 30, 58, False,
                               key=f"base{res_px}", max_px=res_px)
     folium.raster_layers.ImageOverlay(url, bounds=b, name=layer,
                                       opacity=opacity).add_to(fmap)
-elif layer == "LST scenario (°C)":
+elif layer == "LST scenario (\u00b0C)":
     url, b = array_to_overlay(lst_scn, lst_prof, "inferno", 30, 58, False,
                               key="scn"+scn_key, max_px=res_px)
     folium.raster_layers.ImageOverlay(url, bounds=b, name=layer,
@@ -293,21 +301,24 @@ with col_key:
     st.markdown("#### Legend")
     if layer == "U-Net land cover":
         st.markdown(land_cover_legend_html(), unsafe_allow_html=True)
-    elif layer in ("LST baseline (°C)", "LST scenario (°C)"):
-        b64 = colorbar_png("inferno", 30, 58, "LST (°C)")
+    elif layer in ("LST baseline (\u00b0C)", "LST scenario (\u00b0C)"):
+        b64 = colorbar_png("inferno", 30, 58, "LST (\u00b0C)")
         st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
                     unsafe_allow_html=True)
     else:
-        b64 = colorbar_png("Blues", 0, 2.5, "Cooling Δ (°C)")
+        b64 = colorbar_png("Blues", 0, 2.5, "Cooling \u0394 (\u00b0C)")
         st.markdown(f'<img src="data:image/png;base64,{b64}" width="100%">',
                     unsafe_allow_html=True)
 
-with st.expander("ℹ️ How the scenario works"):
+with st.expander("\u2139\ufe0f How the scenario works"):
     st.write(
         "- **5-class land cover** separates **Building/Roof** from **Road/Pavement**, so "
         "green roofs and high-albedo paving apply to their correct surfaces automatically.\n"
-        "- Green roofs → Building/Roof • High-albedo paving → Road/Pavement • "
-        "Vegetation buffers → Bare soil/Sand.\n"
+        "- Green roofs \u2192 Building/Roof \u2022 High-albedo paving \u2192 Road/Pavement \u2022 "
+        "Vegetation buffers \u2192 Bare soil/Sand.\n"
         "- A `done` mask prevents any pixel being treated twice.\n"
+        "- The **targeting strategy** decides which pixels are treated first: 'hottest' "
+        "prioritises the worst heat-offender surfaces (matching the Colab pipeline), "
+        "'coolest' does the reverse, and 'area' selects at random.\n"
         "- Cooling is a first-order **constant subtraction** using empirical coefficients "
-        "(Alaa et al. 2025 and related) — not a physical energy-balance simulation.")
+        "(Alaa et al. 2025 and related) \u2014 not a physical energy-balance simulation.")
