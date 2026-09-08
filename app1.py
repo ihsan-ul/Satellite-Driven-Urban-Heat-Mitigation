@@ -25,9 +25,12 @@ COOL = {
     'high_albedo_pavement': 2.50,
     'veg_buffer':           1.00,
 }
+
 GR_TARGET = CLASS_INDEX["Building/Roof"]
 AL_TARGET = CLASS_INDEX["Road/Pavement"]
 VB_TARGET = CLASS_INDEX["Bare soil/Sand"]
+
+
 STRATEGY  = "hottest"
 
 DATA_DIR = "data"
@@ -37,10 +40,13 @@ DRIVE_IDS = {
     "LST_SCENARIO_10M.tif":   "1CwfWi_la9fSAYEL5xEd-xUj7EX17cRTa",
     "LST_DELTA_10M.tif":      "1EsztD6RBgznCc5zRJX9QsxeCSLtwV8Pl",
 }
+
 LC_FILE   = "LANDCOVER_PRED_10M.tif"
 LST_FILE  = "LST_BASELINE_10M.tif"
+
 MAP_CENTER = [25.10, 55.30]
 MAP_ZOOM   = 10
+
 LC_CMAP = ListedColormap(CLASS_COLORS)
 
 
@@ -74,13 +80,7 @@ def load_array(path, nodata=None):
     return arr, prof, bounds4326
 
 
-@st.cache_data(show_spinner=False)
-def compute_floor(path):
-    arr, _, _ = load_array(path, nodata=-9999.0)
-    return float(np.nanpercentile(arr, 1))
-
-
-def run_scenario(lst, lc, interventions, floor=-np.inf):
+def run_scenario(lst, lc, interventions):
     out  = lst.copy().astype("float32")
     done = np.zeros_like(lc, bool)
     rng  = np.random.default_rng(0)
@@ -101,12 +101,12 @@ def run_scenario(lst, lc, interventions, floor=-np.inf):
         else:
             order = rng.choice(idx, size=n, replace=False)
         rr, cc = np.unravel_index(order, lc.shape)
-        out[rr, cc] = np.maximum(out[rr, cc] - coef, floor)
+        out[rr, cc] -= coef
         done[rr, cc] = True
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=6)
+@st.cache_data(show_spinner=False, max_entries=2)
 def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     """_arr in the source CRS; `key` makes the cache unique per logical layer."""
     src_crs, src_transform = _prof["crs"], _prof["transform"]
@@ -135,6 +135,9 @@ def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     rgba[..., 3] = np.where(alpha, 255, 0)
     buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
     url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    # free the large intermediates before returning (helps the 1 GB tier)
+    del data, alpha, rgba, buf
+    gc.collect()
     return url, [[bottom, left], [top, right]]
 
 
@@ -174,19 +177,21 @@ if not (os.path.exists(lc_path) and os.path.exists(lst_path)):
 landcover, lc_prof, bounds = load_array(lc_path, nodata=255)
 landcover = np.nan_to_num(landcover, nan=255).astype("int16")
 lst10, lst_prof, _         = load_array(lst_path, nodata=-9999.0)
-LST_FLOOR = compute_floor(lst_path)
 
 st.sidebar.header("\U0001F39B\ufe0f Scenario controls")
+
 st.sidebar.markdown("**Green roofs** \u2192 Building/Roof")
 gr_on   = st.sidebar.checkbox("Enable green roofs", value=True)
 gr_frac = st.sidebar.slider("Green-roof coverage (%)", 0, 100, 20, 5) / 100
 gr_coef = st.sidebar.select_slider("Green-roof coefficient (\u00b0C)",
                                    options=[1.0, 1.45, 1.83, 2.0], value=1.83)
+
 st.sidebar.markdown("**High-albedo paving** \u2192 Road/Pavement")
 al_on   = st.sidebar.checkbox("Enable high-albedo paving", value=True)
 al_frac = st.sidebar.slider("Albedo coverage (%)", 0, 100, 30, 5) / 100
 al_coef = st.sidebar.select_slider("Albedo coefficient (\u00b0C)",
                                    options=[1.5, 2.0, 2.5, 3.0], value=2.5)
+
 st.sidebar.markdown("**Vegetation buffers** \u2192 Bare soil/Sand")
 vb_on   = st.sidebar.checkbox("Enable veg buffers", value=False)
 vb_frac = st.sidebar.slider("Veg-buffer coverage (%)", 0, 100, 0, 5) / 100
@@ -201,6 +206,7 @@ strategy = st.sidebar.radio(
 
 COOL['green_roof_hotarid']   = gr_coef
 COOL['high_albedo_pavement'] = al_coef
+
 interventions = []
 if gr_on and gr_frac > 0:
     interventions.append({'name': 'green_roof_hotarid', 'fraction': gr_frac,
@@ -226,15 +232,18 @@ st.sidebar.header("\U0001F3A8 Appearance")
 opacity = st.sidebar.slider("Layer opacity", 0.0, 1.0, 0.85, 0.05,
     help="Raise toward 1.0 so the basemap stops bleeding through gaps between buildings.")
 res_px = st.sidebar.select_slider("Display resolution (px)",
-    options=[800, 1100, 1500, 2000, 2500], value=1500,
-    help="Higher = sharper overlays and more solid built-up blocks, but slower.")
+    options=[700, 900, 1100, 1300], value=900,
+    help="Higher = sharper overlays, but uses more memory. Capped at 1300 px "
+         "to stay within the free Streamlit Cloud 1 GB limit.")
 
-lst_scn = run_scenario(lst10, landcover, interventions, floor=LST_FLOOR)
+lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
+
 v          = np.isfinite(delta)
 target_ids = {iv['target_class'] for iv in interventions} or {1}
 in_targets = np.isin(landcover, list(target_ids)) & v
 treated    = in_targets & (delta > 0)
+
 m_all   = float(np.nanmean(delta[v]))            if v.any()          else 0.0
 m_tgt   = float(np.nanmean(delta[in_targets]))   if in_targets.any() else 0.0
 m_treat = float(np.nanmean(delta[treated]))      if treated.any()    else 0.0
@@ -261,6 +270,7 @@ if basemap == "Esri.WorldImagery":
 
 scn_key = (f"{strategy}{gr_on}{gr_frac}{gr_coef}"
            f"{al_on}{al_frac}{al_coef}{vb_on}{vb_frac}{res_px}")
+
 if layer == "U-Net land cover":
     url, b = array_to_overlay(landcover.astype("float32"), lc_prof,
                               None, None, None, True, key=f"lc{res_px}", max_px=res_px)
@@ -287,6 +297,7 @@ gc.collect()
 
 fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 folium.LayerControl(collapsed=False).add_to(fmap)
+
 col_map, col_key = st.columns([4, 1])
 with col_map:
     st_folium(fmap, width=None, height=600, returned_objects=[])
@@ -314,5 +325,4 @@ with st.expander("\u2139\ufe0f How the scenario works"):
         "prioritises the worst heat-offender surfaces (matching the Colab pipeline), "
         "'coolest' does the reverse, and 'area' selects at random.\n"
         "- Cooling is a first-order **constant subtraction** using empirical coefficients "
-        "(Alaa et al. 2025 and related), clamped to a physical floor \u2014 "
-        "not a physical energy-balance simulation.")
+        "(Alaa et al. 2025 and related) \u2014 not a physical energy-balance simulation.")
