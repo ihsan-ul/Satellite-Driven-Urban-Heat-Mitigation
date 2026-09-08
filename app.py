@@ -80,14 +80,14 @@ def load_array(path, nodata=None):
     return arr, prof, bounds4326
 
 
-def run_scenario(lst, lc, interventions):
+def run_scenario(lst, lc, interventions, floor=None):
     out  = lst.copy().astype("float32")
     done = np.zeros_like(lc, bool)
     rng  = np.random.default_rng(0)
-
-
-
-
+  
+    if floor is None:
+        finite = out[np.isfinite(out)]
+        floor = float(np.nanpercentile(finite, 1)) if finite.size else -np.inf
     for iv in interventions:
         coef, frac, tgt = COOL[iv['name']], iv['fraction'], iv['target_class']
         strat = iv.get('strategy', 'hottest')
@@ -105,7 +105,7 @@ def run_scenario(lst, lc, interventions):
         else:
             order = rng.choice(idx, size=n, replace=False)
         rr, cc = np.unravel_index(order, lc.shape)
-        out[rr, cc] -= coef
+        out[rr, cc] = np.maximum(out[rr, cc] - coef, floor)
         done[rr, cc] = True
     return out
 
