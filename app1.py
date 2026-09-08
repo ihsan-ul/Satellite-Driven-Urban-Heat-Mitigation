@@ -80,10 +80,14 @@ def load_array(path, nodata=None):
     return arr, prof, bounds4326
 
 
-def run_scenario(lst, lc, interventions):
+def run_scenario(lst, lc, interventions, floor=None):
     out  = lst.copy().astype("float32")
     done = np.zeros_like(lc, bool)
     rng  = np.random.default_rng(0)
+  
+    if floor is None:
+        finite = out[np.isfinite(out)]
+        floor = float(np.nanpercentile(finite, 1)) if finite.size else -np.inf
     for iv in interventions:
         coef, frac, tgt = COOL[iv['name']], iv['fraction'], iv['target_class']
         strat = iv.get('strategy', 'hottest')
@@ -101,12 +105,12 @@ def run_scenario(lst, lc, interventions):
         else:
             order = rng.choice(idx, size=n, replace=False)
         rr, cc = np.unravel_index(order, lc.shape)
-        out[rr, cc] -= coef
+        out[rr, cc] = np.maximum(out[rr, cc] - coef, floor)
         done[rr, cc] = True
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=2)
+@st.cache_data(show_spinner=False, max_entries=6)
 def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     """_arr in the source CRS; `key` makes the cache unique per logical layer."""
     src_crs, src_transform = _prof["crs"], _prof["transform"]
@@ -135,9 +139,6 @@ def array_to_overlay(_arr, _prof, cmap, vmin, vmax, discrete, key, max_px):
     rgba[..., 3] = np.where(alpha, 255, 0)
     buf = BytesIO(); Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
     url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    # free the large intermediates before returning (helps the 1 GB tier)
-    del data, alpha, rgba, buf
-    gc.collect()
     return url, [[bottom, left], [top, right]]
 
 
@@ -232,9 +233,8 @@ st.sidebar.header("\U0001F3A8 Appearance")
 opacity = st.sidebar.slider("Layer opacity", 0.0, 1.0, 0.85, 0.05,
     help="Raise toward 1.0 so the basemap stops bleeding through gaps between buildings.")
 res_px = st.sidebar.select_slider("Display resolution (px)",
-    options=[700, 900, 1100, 1300], value=900,
-    help="Higher = sharper overlays, but uses more memory. Capped at 1300 px "
-         "to stay within the free Streamlit Cloud 1 GB limit.")
+    options=[800, 1100, 1500, 2000, 2500], value=1500,
+    help="Higher = sharper overlays and more solid built-up blocks, but slower.")
 
 lst_scn = run_scenario(lst10, landcover, interventions)
 delta   = lst10 - lst_scn
