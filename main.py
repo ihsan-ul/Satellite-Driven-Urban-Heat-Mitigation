@@ -16,7 +16,7 @@ print(f"Global seed set to {SEED}")
 from google.colab import userdata
 GEE_PROJECT = userdata.get('GEEID')
 USE_DRIVE = True
-DRIVE_DIR = "/content/drive/MyDrive/UHI_Dubai_2023_updated_final"
+DRIVE_DIR = "/content/drive/MyDrive/UHI_Dubai_2023"
 LOCAL_DIR = "/content/UHI_Dubai"
 try:
     ee.Initialize(project=GEE_PROJECT)
@@ -66,7 +66,6 @@ def landsat_lst():
              .map(prep_landsat))
         merged = merged.merge(c)
     return merged.select('LST').median().clip(AOI).rename('LST')
-
 
 lst_baseline = landsat_lst()
 
@@ -297,7 +296,7 @@ freq = np.zeros(NUM_CLASSES, 'float64')
 freq[uniq] = cnt / cnt.sum()
 CLS_W = np.where(freq > 0, 1.0 / (freq + 1e-6), 0.0)
 CLS_W = (CLS_W / CLS_W[freq > 0].mean()).astype('float32')
-      {CLASS_NAMES[i]: round(float(CLS_W[i]), 2) for i in range(NUM_CLASSES)})
+({CLASS_NAMES[i]: round(float(CLS_W[i]), 2) for i in range(NUM_CLASSES)})
 
 PATCH, STRIDE = 256, 192
 
@@ -403,18 +402,21 @@ del Xtr, Ytr, Wtr; gc.collect()
 
 from sklearn.metrics import confusion_matrix, f1_score
 
-y_true_all, y_pred_all = [], []
+
+patch_true, patch_pred = [], []
 EVAL_BATCH = 4
 for i in range(0, len(Xva), EVAL_BATCH):
     xb   = Xva[i:i+EVAL_BATCH].astype('float32')
     pred = model.predict(xb, verbose=0).argmax(-1).astype('uint8')
     yb   = Yva[i:i+EVAL_BATCH].astype('uint8')
     wb   = Wva[i:i+EVAL_BATCH].astype('float32') > 0
-    y_true_all.append(yb[wb])
-    y_pred_all.append(pred[wb])
-y_true = np.concatenate(y_true_all)
-y_pred = np.concatenate(y_pred_all)
-del y_true_all, y_pred_all; gc.collect()
+    for j in range(xb.shape[0]):
+        m = wb[j]
+        if m.any():
+            patch_true.append(yb[j][m])
+            patch_pred.append(pred[j][m])
+y_true = np.concatenate(patch_true)
+y_pred = np.concatenate(patch_pred)
 
 _labels = np.arange(NUM_CLASSES)
 cm      = confusion_matrix(y_true, y_pred, labels=_labels)
@@ -435,14 +437,16 @@ print(f"\nBenchmark (proposal 2.4.3): mIoU > 57%  ->  "
       f"{'PASS' if np.nanmean(iou) > _target else 'BELOW TARGET'}")
 
 
-def bootstrap_seg_ci(y_true, y_pred, n_boot=300, seed=SEED):
+def bootstrap_seg_ci(patch_true, patch_pred, n_boot=1000, seed=SEED):
+
     rng = np.random.default_rng(seed)
     labels = np.arange(NUM_CLASSES)
-    N = len(y_true)
+    P = len(patch_true)
     mious, mf1s = [], []
     for _ in range(n_boot):
-        s = rng.integers(0, N, N)
-        yt, yp = y_true[s], y_pred[s]
+        pick = rng.integers(0, P, P)
+        yt = np.concatenate([patch_true[k] for k in pick])
+        yp = np.concatenate([patch_pred[k] for k in pick])
         cmb = confusion_matrix(yt, yp, labels=labels)
         it = np.diag(cmb).astype('float64')
         un = cmb.sum(0) + cmb.sum(1) - it
@@ -452,12 +456,13 @@ def bootstrap_seg_ci(y_true, y_pred, n_boot=300, seed=SEED):
     ci = lambda v: np.percentile(v, [2.5, 50, 97.5])
     return ci(mious), ci(mf1s)
 
-miou_ci, mf1_ci = bootstrap_seg_ci(y_true, y_pred, n_boot=300)
+miou_ci, mf1_ci = bootstrap_seg_ci(patch_true, patch_pred, n_boot=1000)
+print(f"   Validation patches (bootstrap units): {len(patch_true)}")
 print(f"   mIoU     : {miou_ci[1]:.3f}  (95% CI {miou_ci[0]:.3f} - {miou_ci[2]:.3f})")
 print(f"   Macro-F1 : {mf1_ci[1]:.3f}  (95% CI {mf1_ci[0]:.3f} - {mf1_ci[2]:.3f})")
 print(f"   Benchmark mIoU > 0.57 -> "
       f"{'PASS (CI above target)' if miou_ci[0] > 0.57 else 'point est. passes; CI touches target' if miou_ci[1] > 0.57 else 'BELOW'}")
-del y_true, y_pred, cm; gc.collect()
+del y_true, y_pred, cm, patch_true, patch_pred; gc.collect()
 
 prob = np.zeros((H, W, NUM_CLASSES), 'float32'); cnt = np.zeros((H, W), 'float32')
 for r in starts(H, PATCH, STRIDE):
@@ -502,7 +507,7 @@ OSM_CLASSES      = [1, 2]
 
 for i in SPECTRAL_CLASSES:
     print(f"      {CLASS_NAMES[i]:<16} IoU={iou[i]:.3f}  F1={f1_per[i]:.3f}")
-print(f"      -> spectral mIoU = {np.nanmean([iou[i] for i in SPECTRAL_CLASSES]):.3f}")
+print(f"spectral mIoU = {np.nanmean([iou[i] for i in SPECTRAL_CLASSES]):.3f}")
 
 
 cm_norm = cm_dep.astype('float64') / cm_dep.sum(axis=1, keepdims=True).clip(min=1)
@@ -767,7 +772,7 @@ for k, mmeta in COEF_META.items():
           f"{mmeta['quantity']:>9}   {mmeta['source']} ({mmeta['climate']})")
 mismatch = [k for k, mmeta in COEF_META.items() if mmeta['quantity'] != 'LST']
 if mismatch:
-    print("   [!] UNIT CAVEAT: these coefficients are NOT native LST reductions:",
+    print("[!] UNIT CAVEAT: these coefficients are NOT native LST reductions:",
           mismatch)
 
 
@@ -791,7 +796,8 @@ for _ in range(300):
     mc.append(treated_only_cooling(draw))
 mc = np.array(mc)
 lo, med, hi = np.percentile(mc, [2.5, 50, 97.5])
-print(f"   Mean cooling (treated) = {med:.2f} C  (95% CI {lo:.2f} - {hi:.2f} C)")
+print(f"Mean cooling (treated) = {med:.2f} C  (95% CI {lo:.2f} - {hi:.2f} C)")
+
 
 import matplotlib.pyplot as plt
 fr = np.linspace(0, 1, 11)
@@ -808,3 +814,4 @@ plt.ylabel('City-wide mean cooling (C)')
 plt.title('Sensitivity of city cooling to intervention intensity')
 plt.legend(); plt.grid(True); plt.tight_layout()
 plt.savefig(os.path.join(OUT, 'sensitivity.png'), dpi=120); plt.show()
+
